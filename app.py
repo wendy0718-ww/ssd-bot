@@ -2102,24 +2102,38 @@ def run_alert_summary_job(
     try:
         summary_resp = anthropic.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2048,
+            max_tokens=3000,
             messages=[{
                 "role": "user",
                 "content": (
                     f"You are the SSD Bot generating a weekly alert digest for the SSD support team at Conviva.\n\n"
-                    f"Below is structured alert data from #piccolo-daas-alert for {start_date} to {end_date}.\n"
-                    f"Write a concise, actionable Slack-formatted digest using *bold* section headers, bullet points, and no Markdown tables.\n\n"
-                    f"Include:\n"
-                    f"- Header with total count and date range\n"
-                    f"- Top noisy alerts (likely benign, just high volume) — note they're known issues\n"
-                    f"- Alerts that may need attention or investigation\n"
-                    f"- Any patterns worth highlighting, enriched with team discussion context where available\n\n"
-                    f"IMPORTANT: Only state root causes that are explicitly supported by the alert data or team discussion below. "
-                    f"Do NOT guess or invent specific server names, hostnames, or technical root causes. "
-                    f"If root cause is unknown, say 'root cause unknown — see team discussion' or 'needs investigation'.\n\n"
-                    f"Known recurring noise: delete_view (known, CE-12195), "
-                    f"copy_and_deliver lock timeout (known, tracked), "
-                    f"hourly_ssd_monitor_dag (intentional SlingTV/Disney monitor).\n\n"
+                    f"Below is structured alert data from #piccolo-daas-alert for {start_date} to {end_date}.\n\n"
+                    f"Write a Slack-formatted digest that mirrors the team's standard report structure:\n\n"
+                    f"---\n"
+                    f"REQUIRED STRUCTURE (use exactly this order and headings):\n\n"
+                    f"1. *:bar_chart: SSD Alert Digest — {start_date} → {end_date}*\n"
+                    f"   Total alerts: N | Distinct issues: M\n\n"
+                    f"2. *:zap: DO THIS FIRST* (only if there is a clear highest-leverage quick win this week — a fix that is known, low-risk, and would cut significant alert volume. Skip this section if nothing qualifies.)\n\n"
+                    f"3. *:white_check_mark: Fixed — confirmed working*\n"
+                    f"   Issues that have a CE ticket AND alert volume dropped this week. Format each as:\n"
+                    f"   • *<pipeline/issue name>* — <count> alerts (down from <prev>)\n"
+                    f"     `[CE-XXXXX]` `[Fixed: <date if known>]` <one-line summary>\n\n"
+                    f"4. *:red_circle: Still Open — ranked by leverage*\n"
+                    f"   Actionable issues that need attention, ranked highest-impact first. Format each as:\n"
+                    f"   • *<pipeline/issue name>* — <count> alerts <trend emoji: 📈getting worse / ➡️stable / 📉improving>\n"
+                    f"     `[CE-XXXXX]` OR `[No CE]` | `[Fix known]` OR `[No fix yet]`\n"
+                    f"     Root cause: <what's known from alerts or team discussion, or 'unknown — needs investigation'>\n"
+                    f"     Action: <specific next step>\n\n"
+                    f"5. *:large_yellow_circle: Low priority — self-resolving / known noise*\n"
+                    f"   Issues that are tracked, benign, or self-resolve. One bullet per issue:\n"
+                    f"   • *<name>* — <count> alerts — <reason it's low priority>\n\n"
+                    f"---\n"
+                    f"RULES:\n"
+                    f"- Rank 'Still Open' items by: (1) is fix known? (2) alert volume / trend. Highest-leverage first.\n"
+                    f"- Known noise that always goes in section 5: delete_view (CE-12195), copy_and_deliver lock timeout (tracked), hourly_ssd_monitor_dag (intentional SlingTV/Disney monitor).\n"
+                    f"- NEVER invent CE ticket numbers, server names (e.g. rccp114), or root causes not present in the data or team discussion below.\n"
+                    f"- If root cause is unknown, say exactly: 'root cause unknown — needs investigation'\n"
+                    f"- Use Slack formatting only: *bold*, `code`, bullet points. No markdown tables.\n\n"
                     f"Alert data:\n{raw_data}"
                     f"{team_context}"
                 ),
