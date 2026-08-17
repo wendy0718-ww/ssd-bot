@@ -2549,43 +2549,74 @@ def run_alert_summary_job(
         f"  {dag} [{rc}]: {cnt}" for (dag, rc), cnt in top_pipelines.most_common(15)
     )
 
-    text_prompt = f"""You are writing an SSD alert weekly digest for the Conviva SSD support team Slack channel, covering {start_date} to {end_date}.
+    # Build date label for header (e.g. "Aug 10 – Aug 17, 2026")
+    try:
+        sd = datetime.strptime(start_date, "%Y-%m-%d")
+        ed = datetime.strptime(end_date,   "%Y-%m-%d")
+        date_label = f"{sd.strftime('%b %-d')} – {ed.strftime('%b %-d, %Y')}"
+    except Exception:
+        date_label = f"{start_date} – {end_date}"
 
-Alert data — RC counts (root cause categories, derived from task type and pipeline context):
-{rc_summary}
+    text_prompt = f"""You are writing a weekly SSD alert digest for the Conviva SSD support team Slack channel, covering {start_date} to {end_date}.
 
-Top pipelines by alert count [RC]:
+Alert data — pipeline alert counts by task:
 {pipeline_lines}
+
+Root cause (RC) summary:
+{rc_summary}
 
 Total alert triggers: {total}
 {team_context}
 
-Write the digest in EXACTLY this Slack format (preserve the exact emoji and section headers):
+Write the digest in EXACTLY this Slack format. Follow the structure and emoji precisely:
 
-:bar_chart: *SSD Weekly Alert Summary — {start_date} → {end_date}*
-*Total Alert Triggers:* {total}
+Here's the weekly SSD alert summary for {date_label}:
 
-:small_red_triangle: *Top Noisy Pipelines*
-• *<pipeline name>* — <count> alerts
-  - <task-level breakdown if relevant>
-  ⇒ <brief root cause explanation>
+---
 
-:warning: *Alerts Requiring Attention*
-• *<pipeline/RC>* — <count> alerts
-  ⇒ <what needs to be done or monitored>
+:bar_chart: *Weekly SSD Alert Summary — {date_label}*
+Total alerts fired: {total}
 
-:white_check_mark: *Known Background Noise (expected, low concern)*
-• <RC name> — <count> ⇒ <why it's low concern / self-resolving>
+---
 
-:pushpin: *Summary*
-<1–2 sentence narrative summary of the week>
+:red_circle: *Top Noisy Alert (Needs Attention)*
+• `<dag_id.task_id>` — <count> alerts :warning:
+<2–3 sentence explanation of what this alert means and what to investigate>
+
+---
+
+:large_yellow_circle: *Known / Low-Concern Alerts*
+• `<task>` — <count> alerts (<additional context, e.g. pipeline count>)
+<explanation of why it's low concern>
+  - <affected pipelines if relevant>
+[Repeat bullet for each low-concern RC]
+
+---
+
+:large_orange_circle: *<Category Name> Alerts (Monitor)*
+<1-sentence explanation of what triggered this group>
+• `<dag_id.task_id>` — <count> alert(s)
+[Repeat bullet for each item in the group]
+<1-sentence likely cause>
+
+[Add more :large_orange_circle: sections if there are distinct alert categories that need monitoring but not immediate action]
+
+---
+
+:memo: *Action Items*
+1. :red_circle: <urgent investigation item>
+2. :large_orange_circle: <monitor/check item>
+3. :large_yellow_circle: <verify/confirm item>
+4. :white_check_mark: <no-action known item>
+[Number of items = number of distinct alert groups above]
 
 RULES:
-- Use RC names as the primary grouping (not raw task names).
-- "Known Background Noise" MUST include: delete_view/BQ race (CE-12195, self-resolving), MySQL lock timeout (self-resolving), Disney/SlingTV hourly files delay (by-design monitor).
-- Do NOT invent server names, hostnames, CE numbers, or root causes not present in the data or team discussion above.
+- Top Noisy Alert: the single highest-volume pipeline+task combo that needs investigation.
+- Known / Low-Concern: delete_view/BQ race (CE-12195, self-resolving), MySQL lock timeout (self-resolving), Disney/SlingTV hourly files delay (by-design monitor). Always include these if they appear in the data.
+- Group remaining alerts by logical category (e.g. "DPI Event Sensor Alerts", "Spark Job Alerts", "k8s Pod Failures") with :large_orange_circle:.
+- Do NOT invent server names, hostnames, CE numbers, or root causes not present in the data or team discussion.
 - Unknown root cause → write: "unknown — needs investigation"
-- Note whether root cause is confirmed in #ces-internal-ssd or inferred from alert pattern.
+- Note if root cause is confirmed in #ces-internal-ssd or inferred from alert pattern.
 - Output ONLY the Slack message text. No preamble, no code fences."""
 
     summary_text = ""
@@ -2600,8 +2631,10 @@ RULES:
         logger.error(f"Claude text generation failed: {e}")
         # Fallback: plain RC counts
         summary_text = (
-            f":bar_chart: *SSD Weekly Alert Summary — {start_date} → {end_date}*\n"
-            f"*Total Alert Triggers:* {total}\n\n"
+            f"Here's the weekly SSD alert summary for {date_label}:\n\n"
+            f"---\n\n"
+            f":bar_chart: *Weekly SSD Alert Summary — {date_label}*\n"
+            f"Total alerts fired: {total}\n\n"
             + rc_summary
         )
 
