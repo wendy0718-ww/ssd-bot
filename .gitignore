@@ -1,0 +1,21 @@
+# Environment & secrets
+.env
+.env.*
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Bot runtime state
+memory.json
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

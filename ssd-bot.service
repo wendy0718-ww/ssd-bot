@@ -1,0 +1,33 @@
+# systemd service file for SSD Slack Bot
+# Deploy to: /etc/systemd/system/ssd-bot.service
+#
+# Then run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable ssd-bot
+#   sudo systemctl start ssd-bot
+#   sudo systemctl status ssd-bot
+
+[Unit]
+Description=Conviva SSD Debug Slack Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=conviva                          # change to the user that owns the bot files
+WorkingDirectory=/opt/ssd-bot         # change to where you put the bot files
+ExecStart=/opt/ssd-bot/venv/bin/python app.py
+
+# Load credentials from .env file
+EnvironmentFile=/opt/ssd-bot/.env
+
+# Auto-restart on crash
+Restart=always
+RestartSec=10
+
+# Logging (view with: journalctl -u ssd-bot -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
