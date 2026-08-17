@@ -1969,13 +1969,264 @@ def tool_lookup_pipeline(account_name: str = None, delivery_path: str = None) ->
         return f"Pipeline lookup error: {e}"
 
 
-def _parse_pd_alert_message(text: str):
-    """Parse a PagerDuty Airflow alert Slack message into structured fields."""
-    m = re.search(r'TaskInstance:\s+([^.\s]+)\.(\S+?)\s+\S+\s+\[(\w+)\]', text)
+def _parse_pd_alert_message(text: str, msg_ts: str = ""):
+    """Parse a PagerDuty Airflow alert Slack message into structured fields.
+    Returns dict with dag_id, task_id, state, dag_run_id, execution_date, alert_ts."""
+    m = re.search(
+        r'TaskInstance:\s+([^.\s]+)\.(\S+?)\s+(scheduled__(\S+?))\s+\[(\w+)\]', text
+    )
     if not m:
         return None
-    dag_id, task_id, state = m.group(1), m.group(2), m.group(3)
-    return {"dag_id": dag_id, "task_id": task_id, "state": state}
+    dag_id       = m.group(1)
+    task_id      = m.group(2)
+    dag_run_id   = m.group(3)   # e.g. scheduled__2026-08-15T11:52:00+00:00
+    exec_date    = m.group(4)   # e.g. 2026-08-15T11:52:00+00:00
+    state        = m.group(5)
+    return {
+        "dag_id":       dag_id,
+        "task_id":      task_id,
+        "state":        state,
+        "dag_run_id":   dag_run_id,
+        "execution_date": exec_date,
+        "alert_ts":     float(msg_ts) if msg_ts else None,
+    }
+
+
+# ── RC classification ──────────────────────────────────────────────────────────
+
+# RC_CATEGORIES defines the ordered legend for charts (bottom → top stack)
+RC_CATEGORIES = [
+    "DPI Flow Feed sensor timeout",
+    "delete_view / BQ race",
+    "Disney/SlingTV hourly files delay",
+    "QVC/Scripps HHID dependency",
+    "k8s pod launch failure",
+    "Delivery infra (other)",
+    "MySQL lock timeout",
+    "DPI Event upstream delay",
+    "Untracked long-tail",
+]
+
+RC_COLORS = {
+    "DPI Flow Feed sensor timeout":    "#4FC3F7",
+    "delete_view / BQ race":           "#FF6B5C",
+    "Disney/SlingTV hourly files delay":"#FFC94D",
+    "QVC/Scripps HHID dependency":     "#9575FF",
+    "k8s pod launch failure":          "#F0529B",
+    "Delivery infra (other)":          "#F06292",
+    "MySQL lock timeout":              "#8BD450",
+    "DPI Event upstream delay":        "#4DB6AC",
+    "Untracked long-tail":             "#5C6B72",
+}
+
+_RC_TASK_RULES = [
+    ("sensor_eco_cross_page_event_summary_ssd_minute", "DPI Flow Feed sensor timeout"),
+    ("delete_view",                                    "delete_view / BQ race"),
+    ("check_hourly_ssd",                               "Disney/SlingTV hourly files delay"),
+    ("wait_for_gcs_file",                              "QVC/Scripps HHID dependency"),
+    ("sensor_hourly_ss_ei",                            "QVC/Scripps HHID dependency"),
+    ("copy_and_deliver",                               "MySQL lock timeout"),
+    ("sensor_dpi_event_ssd_hourly",                    "DPI Event upstream delay"),
+]
+
+_K8S_KEYWORDS = [
+    "pod launching failed", "imagepullbackoff", "errimagepull",
+    "crashloopbackoff", "oomkilled", "containercreating",
+]
+
+
+def _classify_rc(dag_id: str, task_id: str, log_text: str = "") -> str:
+    """Map a task failure to a root-cause category."""
+    t = task_id.lower()
+    for pattern, rc in _RC_TASK_RULES:
+        if pattern in t:
+            return rc
+    if t == "trigger_copy_job":
+        if log_text:
+            ll = log_text.lower()
+            if any(kw in ll for kw in _K8S_KEYWORDS):
+                return "k8s pod launch failure"
+        return "Delivery infra (other)"
+    return "Untracked long-tail"
+
+
+def _try_fetch_log_for_rc(dag_id: str, dag_run_id: str, task_id: str) -> str:
+    """Try to fetch the first 1000 chars of a task log from connect Airflow for RC classification.
+    Returns empty string on any failure."""
+    try:
+        instance_env = os.environ.get("AIRFLOW_connect_URL", "")
+        if not instance_env:
+            return ""
+        base = _airflow_api_base(instance_env)
+        path = f"/api/v1/dags/{dag_id}/dagRuns/{dag_run_id}/taskInstances/{task_id}/logs/1"
+        resp = requests.get(
+            f"{base}{path}",
+            headers=_get_airflow_headers(base),
+            timeout=6,
+            verify=False,
+        )
+        if resp.status_code == 200:
+            return resp.text[:1000]
+    except Exception:
+        pass
+    return ""
+
+
+def _fetch_classified_alerts(start_date: str, end_date: str):
+    """Read #piccolo-daas-alert for the period and return a list of alert dicts
+    with RC classification and timestamps. Each dict has:
+      dag_id, task_id, rc, alert_ts (epoch float), alert_date (YYYY-MM-DD)
+    trigger_copy_job alerts attempt a log fetch to sub-classify k8s vs other."""
+    ALERT_CHANNEL = "C03KA6FQR1C"
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_dt   = datetime.strptime(end_date,   "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59, tzinfo=timezone.utc
+    )
+    raw_alerts = []
+    cursor = None
+    for _ in range(20):
+        params = {
+            "channel": ALERT_CHANNEL,
+            "limit":   200,
+            "oldest":  str(start_dt.timestamp()),
+            "latest":  str(end_dt.timestamp()),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = slack_app.client.conversations_history(**params)
+        except Exception as e:
+            logger.warning(f"_fetch_classified_alerts: Slack error: {e}")
+            break
+        for msg in resp.get("messages", []):
+            text = msg.get("text", "")
+            if "TaskInstance:" not in text:
+                continue
+            parsed = _parse_pd_alert_message(text, msg.get("ts", ""))
+            if parsed:
+                raw_alerts.append(parsed)
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    # Classify RC; for trigger_copy_job read log (capped at 8 log fetches)
+    log_fetches = 0
+    classified = []
+    for a in raw_alerts:
+        log_text = ""
+        if a["task_id"].lower() == "trigger_copy_job" and log_fetches < 8:
+            log_text = _try_fetch_log_for_rc(a["dag_id"], a["dag_run_id"], a["task_id"])
+            log_fetches += 1
+        rc = _classify_rc(a["dag_id"], a["task_id"], log_text)
+        ts = a["alert_ts"] or 0.0
+        alert_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d") if ts else start_date
+        classified.append({
+            "dag_id":     a["dag_id"],
+            "task_id":    a["task_id"],
+            "rc":         rc,
+            "alert_ts":   ts,
+            "alert_date": alert_date,
+        })
+    return classified
+
+
+def _generate_rc_chart(alerts: list, start_date: str, end_date: str) -> bytes:
+    """Generate a stacked bar chart (RC by day or week) and return PNG bytes.
+    Weekly reports use daily granularity; monthly (>14 days) use weekly."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+    import io as _io
+    from collections import defaultdict
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_dt   = datetime.strptime(end_date,   "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    n_days   = (end_dt - start_dt).days + 1
+    monthly  = n_days > 14
+
+    # Build buckets
+    if monthly:
+        # Week buckets: "W1", "W2", ...
+        def _bucket(alert_date_str):
+            d = datetime.strptime(alert_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            week_n = ((d - start_dt).days // 7) + 1
+            return f"W{week_n}"
+        n_buckets  = (n_days + 6) // 7
+        bucket_labels = [f"W{i+1}" for i in range(n_buckets)]
+    else:
+        # Day buckets: "Mon\nAug 10"
+        def _bucket(alert_date_str):
+            return alert_date_str
+        all_dates = [(start_dt + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(n_days)]
+        bucket_labels = all_dates
+
+    counts = defaultdict(lambda: defaultdict(int))
+    for a in alerts:
+        b = _bucket(a["alert_date"])
+        counts[b][a["rc"]] += 1
+
+    # Only include RC categories that actually appear
+    active_rcs = [rc for rc in RC_CATEGORIES if any(counts[b].get(rc, 0) > 0 for b in bucket_labels)]
+    if not active_rcs:
+        active_rcs = ["Untracked long-tail"]
+
+    fig, ax = plt.subplots(figsize=(max(8, len(bucket_labels) * 0.9 + 2), 5))
+    fig.patch.set_facecolor("#0D1114")
+    ax.set_facecolor("#161B1F")
+
+    x = range(len(bucket_labels))
+    bottoms = [0] * len(bucket_labels)
+    bars = []
+    for rc in active_rcs:
+        vals = [counts[b].get(rc, 0) for b in bucket_labels]
+        bar = ax.bar(x, vals, bottom=bottoms, color=RC_COLORS.get(rc, "#8B9BA3"),
+                     width=0.6, label=rc)
+        bars.append(bar)
+        bottoms = [b + v for b, v in zip(bottoms, vals)]
+
+    # Axis styling
+    if monthly:
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(bucket_labels, color="#8B9BA3", fontsize=10)
+    else:
+        short_labels = [
+            datetime.strptime(d, "%Y-%m-%d").strftime("%a\n%b %-d")
+            for d in bucket_labels
+        ]
+        ax.set_xticks(list(x))
+        ax.set_xticklabels(short_labels, color="#8B9BA3", fontsize=9)
+
+    ax.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+    ax.tick_params(colors="#8B9BA3", which="both")
+    ax.spines["bottom"].set_color("#2A3238")
+    ax.spines["left"].set_color("#2A3238")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.label.set_color("#8B9BA3")
+    ax.set_ylabel("Alert triggers", color="#8B9BA3", fontsize=9)
+
+    # Legend below chart
+    legend = ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18 if not monthly else -0.15),
+        ncol=min(3, len(active_rcs)),
+        frameon=False,
+        fontsize=8,
+        labelcolor="#8B9BA3",
+    )
+
+    title = f"Alert triggers by RC — {start_date} → {end_date}"
+    ax.set_title(title, color="#E7ECEE", fontsize=11, pad=10)
+
+    fig.tight_layout(rect=[0, 0.12, 1, 1])
+    buf = _io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 def tool_read_ssd_alerts(start_date: str = None, end_date: str = None) -> str:
@@ -2034,16 +2285,16 @@ def tool_read_ssd_alerts(start_date: str = None, end_date: str = None) -> str:
 
     from collections import Counter
     task_counts = Counter((a["dag_id"], a["task_id"]) for a in alerts)
-    task_only   = Counter(a["task_id"] for a in alerts)
+    rc_counts   = Counter(_classify_rc(a["dag_id"], a["task_id"]) for a in alerts)
 
     lines = [
         f"*SSD Alert Data: {start_date} → {end_date}*",
-        f"Total alert triggers: {len(alerts)} (these are alerts that fired during this period; resolution status is tracked separately by PagerDuty and not reflected here)",
+        f"Total alert triggers: {len(alerts)}",
         "",
-        "*Alerts by task type:*",
+        "*Alerts by root cause (RC):*",
     ]
-    for task, count in task_only.most_common():
-        lines.append(f"  {task}: {count}")
+    for rc, count in rc_counts.most_common():
+        lines.append(f"  {rc}: {count}")
     lines.append("")
     lines.append("*Top pipelines by alert count (DAG.task):*")
     for (dag, task), count in task_counts.most_common(20):
@@ -2051,34 +2302,213 @@ def tool_read_ssd_alerts(start_date: str = None, end_date: str = None) -> str:
     return "\n".join(lines)
 
 
+def _build_html_report(data: dict, start_date: str, end_date: str) -> str:
+    """Render structured report JSON into a standalone HTML file matching the team's report style."""
+    from html import escape as h
+
+    def badge(label, style):
+        styles = {
+            "open":      "background:#3A2416;color:#FFB874;border:1px solid #5C3B1E",
+            "worse":     "background:#3A1616;color:#FF7070;border:1px solid #5C2020",
+            "watch":     "background:#2E1B33;color:#DBA0F0;border:1px solid #47294F",
+            "fixed":     "background:#173226;color:#7FE0B0;border:1px solid #23503A",
+            "bydesign":  "background:#152A38;color:#7FCBEE;border:1px solid #1F4356",
+        }
+        s = styles.get(style, styles["open"])
+        return f'<span style="display:inline-block;font-size:10.5px;padding:2px 9px;border-radius:20px;font-family:monospace;{s}">{h(label)}</span>'
+
+    def tag(label, kind):
+        styles = {
+            "ce":      "background:#173226;color:#7FE0B0;border:1px solid #23503A",
+            "noce":    "background:#3A2416;color:#FFB874;border:1px solid #5C3B1E",
+            "fix":     "background:#152A38;color:#7FCBEE;border:1px solid #1F4356",
+            "nofix":   "background:#3A2416;color:#FFB874;border:1px solid #5C3B1E",
+        }
+        s = styles.get(kind, styles["noce"])
+        return f'<span style="font-family:monospace;font-size:11px;padding:3px 9px;border-radius:4px;{s}">{h(label)}</span>'
+
+    def trend_html(t):
+        return {"up": "📈 <span style='color:#FF7070'>getting worse</span>",
+                "stable": "➡️ <span style='color:#8B9BA3'>stable</span>",
+                "down": "📉 <span style='color:#7FE0B0'>improving</span>"}.get(t, "")
+
+    # ── Stats strip breakdown ──────────────────────────────────────────────────
+    total = data.get("total_triggers", 0)
+    breakdown_rows = ""
+    for item in data.get("breakdown", [])[:6]:
+        breakdown_rows += (
+            f'<div style="font-size:13px;color:#E7ECEE;margin-bottom:4px">'
+            f'<span style="font-family:monospace;font-weight:700;color:#4FC3F7;'
+            f'display:inline-block;min-width:32px;margin-right:6px">{item["count"]}</span>'
+            f'{h(item["task"])}</div>'
+        )
+
+    # ── DO THIS FIRST ──────────────────────────────────────────────────────────
+    dtf = data.get("do_this_first")
+    dtf_html = ""
+    if dtf:
+        dtf_html = f"""
+    <div style="background:linear-gradient(180deg,#1A1420,#171320);border:1px solid #4A2F5C;
+                border-radius:8px;padding:20px 22px;margin:0 0 28px">
+      <div style="display:inline-block;font-family:monospace;font-size:11px;font-weight:700;
+                  letter-spacing:.08em;color:#0D1114;background:#F0529B;
+                  padding:4px 10px;border-radius:4px;margin-bottom:12px">DO THIS FIRST</div>
+      <div style="font-size:16px;font-weight:650;margin-bottom:10px">{h(dtf.get("title",""))}</div>
+      <div style="font-size:13px;color:#E7ECEE;line-height:1.6">{h(dtf.get("description",""))}</div>
+      <div style="font-size:12px;color:#DBA0F0;margin-top:8px">Impact: {h(dtf.get("impact",""))}</div>
+    </div>"""
+
+    # ── Fixed cards ────────────────────────────────────────────────────────────
+    fixed_cards = ""
+    for item in data.get("fixed", []):
+        ce_tag = tag(item["ce"], "ce") if item.get("ce") else tag("No CE", "noce")
+        fixed_tag = tag(f'Fixed: {item.get("fixed_date","")}', "fix") if item.get("fixed_date") else tag("Fix confirmed", "fix")
+        fixed_cards += f"""
+    <div style="background:#161B1F;border:1px solid #2A3238;border-left:3px solid #4FC3F7;
+                border-radius:8px;padding:16px 18px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">
+        <span style="font-weight:650;font-size:14px">{h(item["name"])}</span>
+        <span style="font-family:monospace;font-size:11px;color:#8B9BA3">{item["count"]} alerts</span>
+        {badge("fixed · confirmed working","fixed")}
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">{ce_tag}{fixed_tag}</div>
+      <div style="font-size:13px;color:#E7ECEE">{h(item.get("summary",""))}</div>
+    </div>"""
+    if not fixed_cards:
+        fixed_cards = '<div style="font-size:13px;color:#5C6B72;padding:8px 0">None this period</div>'
+
+    # ── Open cards ─────────────────────────────────────────────────────────────
+    open_cards = ""
+    for item in data.get("open", []):
+        ce_label = item.get("ce") or "No CE"
+        ce_k = "ce" if item.get("ce") else "noce"
+        fix_label = "Fix known" if item.get("fix_known") else "No fix yet"
+        fix_k = "fix" if item.get("fix_known") else "nofix"
+        status = item.get("status", "open")
+        badge_style = "worse" if "worse" in status else ("watch" if "watch" in status else "open")
+        border_color = "#FF6B5C" if badge_style == "worse" else ("#9575FF" if badge_style == "watch" else "#F0529B")
+        open_cards += f"""
+    <div style="background:#161B1F;border:1px solid #2A3238;border-left:3px solid {border_color};
+                border-radius:8px;padding:16px 18px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap">
+        <span style="font-weight:650;font-size:14px">{h(item["name"])}</span>
+        <span style="font-family:monospace;font-size:11px;color:#8B9BA3">{item["count"]} alerts</span>
+        {trend_html(item.get("trend","stable"))}
+        {badge(status, badge_style)}
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+        {tag(ce_label, ce_k)}{tag(fix_label, fix_k)}
+      </div>
+      <div style="font-size:12.5px;margin-bottom:4px"><span style="color:#5C6B72;text-transform:uppercase;font-size:10px;letter-spacing:.06em">Root cause</span><br>{h(item.get("root_cause","unknown — needs investigation"))}</div>
+      <div style="font-size:12.5px;margin-top:8px"><span style="color:#5C6B72;text-transform:uppercase;font-size:10px;letter-spacing:.06em">Action</span><br>{h(item.get("action",""))}</div>
+    </div>"""
+    if not open_cards:
+        open_cards = '<div style="font-size:13px;color:#5C6B72;padding:8px 0">No open items this period 🎉</div>'
+
+    # ── Low priority ───────────────────────────────────────────────────────────
+    low_rows = ""
+    for item in data.get("low_priority", []):
+        low_rows += (
+            f'<div style="font-size:13px;color:#E7ECEE;margin-bottom:6px">'
+            f'<b>{h(item["name"])}</b> — {item["count"]} alerts'
+            f'<span style="color:#8B9BA3;margin-left:8px">— {h(item["reason"])}</span></div>'
+        )
+    if not low_rows:
+        low_rows = '<div style="font-size:13px;color:#5C6B72">None</div>'
+
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SSD Alert Digest — {h(start_date)} → {h(end_date)}</title>
+<style>
+  *{{box-sizing:border-box;}}
+  body{{margin:0;background:#0D1114;color:#E7ECEE;
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+       line-height:1.5;padding:32px 20px 60px;}}
+  .wrap{{max-width:900px;margin:0 auto;}}
+  h2{{font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:#8B9BA3;
+      font-weight:650;margin:44px 0 16px;border-bottom:1px solid #2A3238;padding-bottom:8px;}}
+  a{{color:#4FC3F7;}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div style="margin-bottom:28px;border-bottom:1px solid #2A3238;padding-bottom:22px">
+    <div style="font-family:monospace;font-size:11px;letter-spacing:.14em;text-transform:uppercase;
+                color:#4FC3F7;margin-bottom:10px">{h(start_date)} – {h(end_date)}</div>
+    <h1 style="font-size:28px;margin:0 0 8px;font-weight:650;letter-spacing:-0.01em">SSD Alert Digest</h1>
+    <div style="color:#8B9BA3;font-size:14.5px">PagerDuty alert data from #piccolo-daas-alert · generated {generated}</div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:160px 1fr;gap:24px;align-items:center;
+              background:#161B1F;border:1px solid #2A3238;border-radius:8px;padding:20px 22px;margin-bottom:28px">
+    <div style="text-align:center;border-right:1px solid #2A3238;padding-right:20px">
+      <div style="font-size:42px;font-weight:700;font-family:monospace;color:#F0529B;line-height:1">{total}</div>
+      <div style="font-size:11.5px;color:#8B9BA3;margin-top:6px;line-height:1.4">alert triggers<br>this period</div>
+    </div>
+    <div>{breakdown_rows}</div>
+  </div>
+
+  {dtf_html}
+
+  <h2>✅ Fixed — confirmed working</h2>
+  {fixed_cards}
+
+  <h2>🔴 Still Open — ranked by leverage</h2>
+  {open_cards}
+
+  <h2>🟡 Low priority — self-resolving / known noise</h2>
+  <div style="background:#161B1F;border:1px solid #2A3238;border-radius:8px;padding:16px 18px">
+    {low_rows}
+  </div>
+
+  <div style="margin-top:50px;padding-top:18px;border-top:1px solid #2A3238;
+              font-size:11.5px;color:#5C6B72">
+    Generated by SSD Bot from #piccolo-daas-alert · {generated}
+  </div>
+
+</div>
+</body>
+</html>"""
+
+
 def run_alert_summary_job(
     start_date: str = None,
     end_date: str = None,
     post_channel: str = "C07KV3PB79C",
 ) -> str:
-    """Fetch alert data, generate a narrative summary via Claude, and post to Slack.
+    """Generate RC-based alert digest with inline chart + text summary. Posts directly to Slack channel.
     Called by the weekly scheduler and by the manual bot trigger."""
+    from collections import Counter
+
+    now = datetime.now(timezone.utc)
     if not end_date:
-        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        end_date = now.strftime("%Y-%m-%d")
     if not start_date:
-        start_date = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
+        start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
 
-    raw_data = tool_read_ssd_alerts(start_date, end_date)
-    if raw_data.startswith("No SSD alerts") or raw_data.startswith("Error") or raw_data.startswith("Invalid"):
-        try:
-            slack_app.client.chat_postMessage(
-                channel=post_channel,
-                text=f"🤖 *SSD Bot — Alert Digest ({start_date} → {end_date})*\n\n{raw_data}",
-            )
-        except Exception as e:
-            logger.error(f"Failed to post empty-alert notice: {e}")
-        return raw_data
+    # ── 1. Fetch and RC-classify alerts ────────────────────────────────────────
+    alerts = _fetch_classified_alerts(start_date, end_date)
+    if not alerts:
+        slack_app.client.chat_postMessage(
+            channel=post_channel,
+            text=f"📊 *SSD Alert Digest — {start_date} → {end_date}*\nNo alerts found in #piccolo-daas-alert for this period.",
+        )
+        return "No alerts found."
 
-    # Read ces-internal-ssd for team discussion during the same period
+    rc_counts = Counter(a["rc"] for a in alerts)
+    total = len(alerts)
+
+    # ── 2. Read #ces-internal-ssd for team discussion ──────────────────────────
     team_context = ""
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+        end_dt   = datetime.strptime(end_date,   "%Y-%m-%d").replace(
             hour=23, minute=59, second=59, tzinfo=timezone.utc
         )
         ssd_resp = slack_app.client.conversations_history(
@@ -2093,79 +2523,113 @@ def run_alert_summary_job(
             if not m.get("bot_id") and m.get("text", "").strip()
         ]
         if msgs:
-            team_context = (
-                "\n\nTeam discussion from #ces-internal-ssd during this period "
-                "(use this to enrich root cause context — e.g. if the team identified "
-                "lock timeout, Databricks delay, etc.):\n"
-                + "\n---\n".join(msgs[:60])
-            )
+            team_context = "\n\nTeam discussion from #ces-internal-ssd:\n" + "\n---\n".join(msgs[:60])
     except Exception as e:
-        logger.warning(f"Could not read ces-internal-ssd for context: {e}")
+        logger.warning(f"Could not read ces-internal-ssd: {e}")
 
+    # ── 3. Generate stacked bar chart and post as inline image ─────────────────
     try:
-        summary_resp = anthropic.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=3000,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"You are the SSD Bot generating a weekly alert digest for the SSD support team at Conviva.\n\n"
-                    f"Below is structured alert data from #piccolo-daas-alert for {start_date} to {end_date}.\n\n"
-                    f"Write a Slack-formatted digest that mirrors the team's standard report structure:\n\n"
-                    f"---\n"
-                    f"REQUIRED STRUCTURE (use exactly this order and headings):\n\n"
-                    f"1. *:bar_chart: SSD Alert Digest — {start_date} → {end_date}*\n"
-                    f"   Total alert triggers: N (this is how many times alerts fired — not active/unresolved count)\n\n"
-                    f"2. *:zap: DO THIS FIRST* (only if there is a clear highest-leverage quick win this week — a fix that is known, low-risk, and would cut significant alert volume. Skip this section if nothing qualifies.)\n\n"
-                    f"3. *:white_check_mark: Fixed — confirmed working*\n"
-                    f"   Issues that have a CE ticket AND alert volume dropped this week. Format each as:\n"
-                    f"   • *<pipeline/issue name>* — <count> alerts (down from <prev>)\n"
-                    f"     `[CE-XXXXX]` `[Fixed: <date if known>]` <one-line summary>\n\n"
-                    f"4. *:red_circle: Still Open — ranked by leverage*\n"
-                    f"   Actionable issues that need attention, ranked highest-impact first. Format each as:\n"
-                    f"   • *<pipeline/issue name>* — <count> alerts <trend emoji: 📈getting worse / ➡️stable / 📉improving>\n"
-                    f"     `[CE-XXXXX]` OR `[No CE]` | `[Fix known]` OR `[No fix yet]`\n"
-                    f"     Root cause: <what's known from alerts or team discussion, or 'unknown — needs investigation'>\n"
-                    f"     Action: <specific next step>\n\n"
-                    f"5. *:large_yellow_circle: Low priority — self-resolving / known noise*\n"
-                    f"   Issues that are tracked, benign, or self-resolve. One bullet per issue:\n"
-                    f"   • *<name>* — <count> alerts — <reason it's low priority>\n\n"
-                    f"---\n"
-                    f"RULES:\n"
-                    f"- Rank 'Still Open' items by: (1) is fix known? (2) alert volume / trend. Highest-leverage first.\n"
-                    f"- Known noise that always goes in section 5: delete_view (CE-12195), copy_and_deliver lock timeout (tracked), hourly_ssd_monitor_dag (intentional SlingTV/Disney monitor).\n"
-                    f"- NEVER invent CE ticket numbers, server names (e.g. rccp114), or root causes not present in the data or team discussion below.\n"
-                    f"- If root cause is unknown, say exactly: 'root cause unknown — needs investigation'\n"
-                    f"- Use Slack formatting only: *bold*, `code`, bullet points. No markdown tables.\n\n"
-                    f"Alert data:\n{raw_data}"
-                    f"{team_context}"
-                ),
-            }],
+        chart_png = _generate_rc_chart(alerts, start_date, end_date)
+        n_days = (datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(start_date, "%Y-%m-%d")).days + 1
+        gran = "daily" if n_days <= 14 else "weekly"
+        slack_app.client.files_upload(
+            channels=post_channel,
+            content=chart_png,
+            filename=f"ssd_rc_chart_{start_date}_{end_date}.png",
+            title=f"SSD alert triggers by RC ({gran} view)",
+            filetype="png",
         )
-        summary_text = summary_resp.content[0].text
     except Exception as e:
-        logger.error(f"Claude summary generation failed: {e}")
-        summary_text = raw_data  # fall back to raw data
+        logger.error(f"Chart generation/upload failed: {e}")
 
-    full_message = f"🤖 *SSD Bot — Alert Digest ({start_date} → {end_date})*\n\n{summary_text}"
-    # Split and post as top-level message (thread_ts=None → top-level)
-    chunks = []
-    text = full_message
-    while len(text) > 3500:
-        cut = text.rfind("\n", 0, 3500)
-        if cut == -1:
-            cut = 3500
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip("\n")
-    chunks.append(text)
+    # ── 4. Ask Claude to write summary in old Slack format ────────────────────
+    rc_summary = "\n".join(f"  {rc}: {cnt}" for rc, cnt in rc_counts.most_common())
+    top_pipelines = Counter((a["dag_id"], a["rc"]) for a in alerts)
+    pipeline_lines = "\n".join(
+        f"  {dag} [{rc}]: {cnt}" for (dag, rc), cnt in top_pipelines.most_common(15)
+    )
+
+    text_prompt = f"""You are writing an SSD alert weekly digest for the Conviva SSD support team Slack channel, covering {start_date} to {end_date}.
+
+Alert data — RC counts (root cause categories, derived from task type and pipeline context):
+{rc_summary}
+
+Top pipelines by alert count [RC]:
+{pipeline_lines}
+
+Total alert triggers: {total}
+{team_context}
+
+Write the digest in EXACTLY this Slack format (preserve the exact emoji and section headers):
+
+:bar_chart: *SSD Weekly Alert Summary — {start_date} → {end_date}*
+*Total Alert Triggers:* {total}
+
+:small_red_triangle: *Top Noisy Pipelines*
+• *<pipeline name>* — <count> alerts
+  - <task-level breakdown if relevant>
+  ⇒ <brief root cause explanation>
+
+:warning: *Alerts Requiring Attention*
+• *<pipeline/RC>* — <count> alerts
+  ⇒ <what needs to be done or monitored>
+
+:white_check_mark: *Known Background Noise (expected, low concern)*
+• <RC name> — <count> ⇒ <why it's low concern / self-resolving>
+
+:pushpin: *Summary*
+<1–2 sentence narrative summary of the week>
+
+RULES:
+- Use RC names as the primary grouping (not raw task names).
+- "Known Background Noise" MUST include: delete_view/BQ race (CE-12195, self-resolving), MySQL lock timeout (self-resolving), Disney/SlingTV hourly files delay (by-design monitor).
+- Do NOT invent server names, hostnames, CE numbers, or root causes not present in the data or team discussion above.
+- Unknown root cause → write: "unknown — needs investigation"
+- Note whether root cause is confirmed in #ces-internal-ssd or inferred from alert pattern.
+- Output ONLY the Slack message text. No preamble, no code fences."""
+
+    summary_text = ""
+    try:
+        resp = anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": text_prompt}],
+        )
+        summary_text = resp.content[0].text.strip()
+    except Exception as e:
+        logger.error(f"Claude text generation failed: {e}")
+        # Fallback: plain RC counts
+        summary_text = (
+            f":bar_chart: *SSD Weekly Alert Summary — {start_date} → {end_date}*\n"
+            f"*Total Alert Triggers:* {total}\n\n"
+            + rc_summary
+        )
+
+    # ── 5. Post text in chunks ─────────────────────────────────────────────────
+    lines = summary_text.split("\n")
+    chunks, buf = [], ""
+    for line in lines:
+        if len(buf) + len(line) + 1 > 3000:
+            chunks.append(buf.rstrip())
+            buf = ""
+        buf += line + "\n"
+    if buf.strip():
+        chunks.append(buf.rstrip())
+
+    thread_ts = None
     for i, chunk in enumerate(chunks):
-        if len(chunks) > 1:
-            chunk = f"_{i+1}/{len(chunks)}_\n{chunk}"
         try:
-            slack_app.client.chat_postMessage(channel=post_channel, text=chunk)
+            r = slack_app.client.chat_postMessage(
+                channel=post_channel,
+                text=chunk,
+                thread_ts=thread_ts if i > 0 else None,
+            )
+            if i == 0:
+                thread_ts = r["ts"]
         except Exception as e:
-            logger.error(f"Failed to post alert digest chunk {i}: {e}")
-    return f"Alert digest posted ({len(alerts) if 'alerts' in dir() else '?'} alerts, {start_date}→{end_date})."
+            logger.error(f"Failed to post digest chunk {i}: {e}")
+
+    return f"Digest posted ({total} alerts, {start_date}→{end_date})."
 
 
 def tool_read_slack_channel(channel_name: str, limit: int = 30) -> str:
