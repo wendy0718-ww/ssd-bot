@@ -1975,14 +1975,19 @@ def _parse_pd_alert_message(text: str):
     if not m:
         return None
     dag_id, task_id, state = m.group(1), m.group(2), m.group(3)
-    resolved = ":large_green_circle:" in text
-    return {"dag_id": dag_id, "task_id": task_id, "state": state, "resolved": resolved}
+    return {"dag_id": dag_id, "task_id": task_id, "state": state}
 
 
-def tool_read_ssd_alerts(start_date: str, end_date: str) -> str:
+def tool_read_ssd_alerts(start_date: str = None, end_date: str = None) -> str:
     """Read and parse SSD PagerDuty alerts from #piccolo-daas-alert for the given date range.
-    Dates in YYYY-MM-DD format (UTC). Returns grouped counts for Claude to summarize."""
+    Dates in YYYY-MM-DD format (UTC). Returns grouped counts for Claude to summarize.
+    If dates are omitted, defaults to the last 7 days."""
     ALERT_CHANNEL = "C03KA6FQR1C"
+    now = datetime.now(timezone.utc)
+    if not end_date:
+        end_date = now.strftime("%Y-%m-%d")
+    if not start_date:
+        start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
     try:
         start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
@@ -2028,14 +2033,12 @@ def tool_read_ssd_alerts(start_date: str, end_date: str) -> str:
         return f"No SSD alerts found between {start_date} and {end_date}."
 
     from collections import Counter
-    task_counts   = Counter((a["dag_id"], a["task_id"]) for a in alerts)
-    task_only     = Counter(a["task_id"] for a in alerts)
-    resolved_n    = sum(1 for a in alerts if a["resolved"])
-    unresolved_n  = len(alerts) - resolved_n
+    task_counts = Counter((a["dag_id"], a["task_id"]) for a in alerts)
+    task_only   = Counter(a["task_id"] for a in alerts)
 
     lines = [
         f"*SSD Alert Data: {start_date} → {end_date}*",
-        f"Total PagerDuty alerts: {len(alerts)} ({resolved_n} resolved, {unresolved_n} unresolved/active)",
+        f"Total alert triggers: {len(alerts)} (these are alerts that fired during this period; resolution status is tracked separately by PagerDuty and not reflected here)",
         "",
         "*Alerts by task type:*",
     ]
@@ -2112,7 +2115,7 @@ def run_alert_summary_job(
                     f"---\n"
                     f"REQUIRED STRUCTURE (use exactly this order and headings):\n\n"
                     f"1. *:bar_chart: SSD Alert Digest — {start_date} → {end_date}*\n"
-                    f"   Total alerts: N | Distinct issues: M\n\n"
+                    f"   Total alert triggers: N (this is how many times alerts fired — not active/unresolved count)\n\n"
                     f"2. *:zap: DO THIS FIRST* (only if there is a clear highest-leverage quick win this week — a fix that is known, low-risk, and would cut significant alert volume. Skip this section if nothing qualifies.)\n\n"
                     f"3. *:white_check_mark: Fixed — confirmed working*\n"
                     f"   Issues that have a CE ticket AND alert volume dropped this week. Format each as:\n"
@@ -3074,14 +3077,14 @@ AGENT_TOOLS = [
             "properties": {
                 "start_date": {
                     "type": "string",
-                    "description": "Start date in YYYY-MM-DD format (UTC), inclusive.",
+                    "description": "Start date in YYYY-MM-DD format (UTC), inclusive. If omitted, defaults to 7 days before today.",
                 },
                 "end_date": {
                     "type": "string",
-                    "description": "End date in YYYY-MM-DD format (UTC), inclusive.",
+                    "description": "End date in YYYY-MM-DD format (UTC), inclusive. If omitted, defaults to today.",
                 },
             },
-            "required": ["start_date", "end_date"],
+            "required": [],
         },
     },
     {
@@ -3775,9 +3778,11 @@ def handle_answer(question: str, client, channel: str, thread_ts: str, user: str
         messages = history + [{"role": "user", "content": question}]
         sources  = []
 
-        # Inject persistent memory into the system prompt for this query
+        # Inject today's date and persistent memory into the system prompt for this query
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        date_injection = f"\n\n⚠️ CURRENT DATE (authoritative): {today_str} UTC. Always use this date when resolving natural-language time references like 'last week', 'yesterday', 'this month', 'last 7 days'. Do NOT use any other year or date from training data."
         mem = _memory_context_string()
-        system = AGENT_SYSTEM + (f"\n\n{mem}" if mem else "")
+        system = AGENT_SYSTEM + date_injection + (f"\n\n{mem}" if mem else "")
 
         # Context passed to write tools (propose_confluence_update etc.)
         tool_ctx = {"channel": channel, "thread_ts": thread_ts, "user": user, "client": client}
