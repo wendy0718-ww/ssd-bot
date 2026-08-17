@@ -3230,8 +3230,8 @@ OFFLINE SSD CUSTOMER MAPPING (hardcoded — not in Support Tools):
 
 AIRFLOW URL → INSTANCE MAPPING (use when user pastes a URL):
   airflow-prod.mds.conviva.com          → instance="connect"
-  conviva-airflow.prod.conviva.com      → instance="streamid"
   rke-shared-1.iad4.prod.conviva.com    → instance="streamid"
+  conviva-airflow.prod.conviva.com      → instance="streamnew"
   datafeeds-airflow.prod.conviva.com    → instance="legacy"
   Any other host                         → omit instance (try all)
   Extract dag_id from the URL query param: ?dag_id=<DAG_ID> or /tree?dag_id=<DAG_ID>
@@ -3241,6 +3241,20 @@ IMPORTANT DISTINCTIONS:
   "how many connect pipelines?"     → instance="connect", NO name_filters             (all DAGs in the connect system are connect pipelines)
   "find legacy_dag_xyz in connect"  → instance="connect", name_filters=["legacy_dag_xyz"]
   instance="legacy" with NO name_filters = every DAG in that Airflow system, NOT just legacy pipelines.
+
+━━━ STREAMID AIRFLOW MIGRATION — TWO-INSTANCE QUERY STRATEGY ━━━
+The StreamID Airflow is being migrated. DAGs are split across two instances:
+  instance="streamid"  → old URL (rke-shared-1.iad4.prod.conviva.com) — DAGs not yet migrated
+  instance="streamnew" → new URL (conviva-airflow.prod.conviva.com)    — DAGs already migrated
+
+When querying a StreamID DAG, follow this fallback strategy:
+  1. Try instance="streamid" first.
+  2. If the result shows is_paused=true OR no runs in the past 7 days → the DAG has likely been
+     migrated. Immediately retry with instance="streamnew".
+  3. Report which instance the data came from so the user knows.
+
+For Airflow UI links: always use the exact link from the Confluence playbook for that DAG.
+Do NOT construct a link by combining a base URL with a dag_id — you don't know which host the DAG is on.
 
 ━━━ STEP 1 — ALWAYS QUERY CONFLUENCE FIRST ━━━
 Before answering ANY question, always call search_confluence (or read_confluence_page if a page ID/URL
@@ -3318,7 +3332,15 @@ TRIAGE STEPS (always follow in order):
 Step 1 — Check CID_HHID and CID_Community for the affected TZ:
   • call get_airflow_dag_runs for CID_HHID_TZ_N4 and CID_Community_TZ_N4 (instance="streamid")
   • call get_airflow_dag_runs for CID_HHID_TZ_N7 and CID_Community_TZ_N7 (instance="streamid")
-  • If either CID_Community failed → Step 2. If both healthy → root cause is elsewhere.
+  • CRITICAL — for each run, check TWO things:
+    1. RECENCY: These are daily DAGs. The most recent run should be within the past 24-36 hours.
+       If the latest run is more than 2 days ago, flag it as a delay even if the state is "success".
+    2. HIDDEN FAILURES: Also call get_airflow_dag_runs with state='failed' to find any recent
+       failed runs that were subsequently rerun. A rerun after a failure indicates a delay even
+       if the latest state is now "success".
+    3. TIMING: Note the end_date of the last successful run. If it finished much later than
+       usual (e.g., after 10:00 UTC when it normally finishes by 07:00 UTC), flag as delayed.
+  • If either CID_Community failed OR was recently delayed → Step 2. If both healthy → root cause is elsewhere.
 
 Step 2 — Check the shared Databricks job IP_Classification_ConvivaIdJob:
   • Both CID_Community_TZ_N4 and CID_Community_TZ_N7 depend on this Databricks job.
