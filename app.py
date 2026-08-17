@@ -3298,6 +3298,46 @@ Slack formatting rules — apply to ALL your responses:
 - If the user says "forget X", "remove that memory", or "delete memory for X", call delete_memory with the key.
 - If you're not sure whether you already know something, call read_memory first.
 
+━━━ HHID UPSTREAM TRIAGE (QVC / Scripps-Master) ━━━
+When QVC or Scripps-Master pipelines are delayed, stuck at sensor, or failing, follow this
+dependency chain top-down. Do NOT stop after finding the top-level SSD pipeline status —
+always check the HHID upstream chain.
+
+AFFECTED CUSTOMERS:
+  TZ_N4 — QVC / Qurate:
+    SSD pipelines: gcp_copy_parquet_1960185251_QVC (connect), DailySSD_Connect_QVC_Data_Fusion (legacy),
+                   Qurate_AdSSDwHHID_Qurate_v1 (connect), Qurate_ContentSSDwHHID_Prod_Qurate_v1 (connect)
+    HHID chain:    CID_HHID_TZ_N4 (streamid) → CID_Community_TZ_N4 (streamid)
+
+  TZ_N7 — Scripps-Master:
+    SSD pipeline:  Scripps-Master-CSSWH-Daily_Scripps-Master_v1 (connect)
+    HHID chain:    CID_HHID_TZ_N7 (streamid) → CID_Community_TZ_N7 (streamid)
+
+TRIAGE STEPS (always follow in order):
+
+Step 1 — Check CID_HHID and CID_Community for the affected TZ:
+  • call get_airflow_dag_runs for CID_HHID_TZ_N4 and CID_Community_TZ_N4 (instance="streamid")
+  • call get_airflow_dag_runs for CID_HHID_TZ_N7 and CID_Community_TZ_N7 (instance="streamid")
+  • If either CID_Community failed → Step 2. If both healthy → root cause is elsewhere.
+
+Step 2 — Check the shared Databricks job IP_Classification_ConvivaIdJob:
+  • Both CID_Community_TZ_N4 and CID_Community_TZ_N7 depend on this Databricks job.
+  • Link: https://6189788464754029.9.gcp.databricks.com/jobs/36751?o=6189788464754029
+  • Tell the user to check this job manually (bot cannot access Databricks directly).
+  • If this job also failed → Step 3.
+
+Step 3 — Check CID_IP_Classifier_Features:
+  • call get_airflow_dag_runs for CID_IP_Classifier_Features (instance="streamid")
+  • Link: https://rke-shared-1.iad4.prod.conviva.com/conviva-airflow-v2/airflow/dags/CID_IP_Classifier_Features/grid
+  • If this also failed → Step 4.
+
+Step 4 — Check PBSS.d data:
+  • PBSS.D Airflow DAG: https://rke-shared-1.iad4.prod.conviva.com/conviva-airflow-v2/airflow/dags/d3_ss_merge_daily/grid
+  • call get_airflow_dag_runs for d3_ss_merge_daily (instance="streamid")
+  • If PBSS data not ready → escalate to DS team / Po-Han Tseng.
+  • If PBSS data IS ready → propose rerunning jobs from upstream to downstream:
+    CID_IP_Classifier_Features → CID_Community_TZ_Nx → CID_HHID_TZ_Nx → SSD pipelines.
+
 ━━━ DPI EVENT FEED TRIAGE (SlingTV / Echostar) ━━━
 IMPORTANT: Do NOT rely on cached memory for the list or count of DPI Event Feed pipelines.
 The authoritative source is the Confluence page — always call read_confluence_page with
