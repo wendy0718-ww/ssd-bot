@@ -61,7 +61,7 @@ def _slack_reply(client, *, channel: str, thread_ts: str,
     Subsequent chunks are posted as new thread replies.
     """
     # Split into chunks that respect the limit
-    chunks: list[str] = []
+    chunks = []
     while len(text) > SLACK_MAX_LEN:
         # Try to cut at a newline to avoid mid-word breaks
         cut = text.rfind("\n", 0, SLACK_MAX_LEN)
@@ -1969,7 +1969,7 @@ def tool_lookup_pipeline(account_name: str = None, delivery_path: str = None) ->
         return f"Pipeline lookup error: {e}"
 
 
-def _parse_pd_alert_message(text: str) -> dict | None:
+def _parse_pd_alert_message(text: str):
     """Parse a PagerDuty Airflow alert Slack message into structured fields."""
     m = re.search(r'TaskInstance:\s+([^.\s]+)\.(\S+?)\s+\S+\s+\[(\w+)\]', text)
     if not m:
@@ -1993,7 +1993,7 @@ def tool_read_ssd_alerts(start_date: str, end_date: str) -> str:
 
     oldest_ts = str(start_dt.timestamp())
     latest_ts = str(end_dt.timestamp())
-    alerts: list[dict] = []
+    alerts = []
     cursor = None
 
     for _ in range(20):  # max 20 pages × 200 = 4000 messages
@@ -2100,7 +2100,7 @@ def run_alert_summary_job(
 
     full_message = f"🤖 *SSD Bot — Alert Digest ({start_date} → {end_date})*\n\n{summary_text}"
     # Split and post as top-level message (thread_ts=None → top-level)
-    chunks: list[str] = []
+    chunks = []
     text = full_message
     while len(text) > 3500:
         cut = text.rfind("\n", 0, 3500)
