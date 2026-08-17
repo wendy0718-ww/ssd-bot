@@ -2542,14 +2542,8 @@ def run_alert_summary_job(
     except Exception as e:
         logger.error(f"Chart generation/upload failed: {e}")
 
-    # ── 4. Ask Claude to write summary in old Slack format ────────────────────
-    rc_summary = "\n".join(f"  {rc}: {cnt}" for rc, cnt in rc_counts.most_common())
-    top_pipelines = Counter((a["dag_id"], a["rc"]) for a in alerts)
-    pipeline_lines = "\n".join(
-        f"  {dag} [{rc}]: {cnt}" for (dag, rc), cnt in top_pipelines.most_common(15)
-    )
-
-    # Build date label for header (e.g. "Aug 10 – Aug 17, 2026")
+    # ── 4. Ask Claude to write summary in Jul-14 style format ─────────────────
+    # Build date label (e.g. "Aug 10 – Aug 17, 2026")
     try:
         sd = datetime.strptime(start_date, "%Y-%m-%d")
         ed = datetime.strptime(end_date,   "%Y-%m-%d")
@@ -2557,10 +2551,25 @@ def run_alert_summary_job(
     except Exception:
         date_label = f"{start_date} – {end_date}"
 
+    # Pipeline-level counts
+    dag_counts = Counter(a["dag_id"] for a in alerts)
+    dag_lines = "\n".join(
+        f"  {dag}: {cnt}" for dag, cnt in dag_counts.most_common(30)
+    )
+    # Task-type counts
+    task_type_counts = Counter(a["task_id"] for a in alerts)
+    task_lines = "\n".join(
+        f"  {tid}: {cnt}" for tid, cnt in task_type_counts.most_common()
+    )
+    rc_summary = "\n".join(f"  {rc}: {cnt}" for rc, cnt in rc_counts.most_common())
+
     text_prompt = f"""You are writing a weekly SSD alert digest for the Conviva SSD support team Slack channel, covering {start_date} to {end_date}.
 
-Alert data — pipeline alert counts by task:
-{pipeline_lines}
+Task type alert counts:
+{task_lines}
+
+Pipeline (dag_id) alert counts:
+{dag_lines}
 
 Root cause (RC) summary:
 {rc_summary}
@@ -2568,55 +2577,59 @@ Root cause (RC) summary:
 Total alert triggers: {total}
 {team_context}
 
-Write the digest in EXACTLY this Slack format. Follow the structure and emoji precisely:
+Write the digest in EXACTLY this Slack format (copy the structure, emoji, and section headers precisely — do not add, remove, or rename sections):
 
 Here's the weekly SSD alert summary for {date_label}:
 
 ---
 
-:bar_chart: *Weekly SSD Alert Summary — {date_label}*
-Total alerts fired: {total}
+:bar_chart: Weekly SSD PagerDuty Alert Summary
+Period: {date_label}
+Total Alerts: {total}
 
 ---
 
-:red_circle: *Top Noisy Alert (Needs Attention)*
-• `<dag_id.task_id>` — <count> alerts :warning:
-<2–3 sentence explanation of what this alert means and what to investigate>
+Alert Breakdown by Task Type:
+• <task_id> — <count> alerts (<one-phrase description: e.g. "Spark job failures/timeouts", "upstream sensor / pipeline wait issues">)
+[one bullet per distinct task_id, most frequent first]
 
 ---
 
-:large_yellow_circle: *Known / Low-Concern Alerts*
-• `<task>` — <count> alerts (<additional context, e.g. pipeline count>)
-<explanation of why it's low concern>
-  - <affected pipelines if relevant>
-[Repeat bullet for each low-concern RC]
+:fire: Top Noisy Pipelines (Likely Need Investigation):
+• <dag_id> — <count> alerts :rotating_light: Highest this week
+• <dag_id> — <count> alerts
+[top 3-5 pipelines by alert count]
 
 ---
 
-:large_orange_circle: *<Category Name> Alerts (Monitor)*
-<1-sentence explanation of what triggered this group>
-• `<dag_id.task_id>` — <count> alert(s)
-[Repeat bullet for each item in the group]
-<1-sentence likely cause>
-
-[Add more :large_orange_circle: sections if there are distinct alert categories that need monitoring but not immediate action]
+:clipboard: Mid-Range Alerts (<count> each — possible recurring issues):
+• <dag_id>
+[pipelines with similar mid-tier counts]
 
 ---
 
-:memo: *Action Items*
-1. :red_circle: <urgent investigation item>
-2. :large_orange_circle: <monitor/check item>
-3. :large_yellow_circle: <verify/confirm item>
-4. :white_check_mark: <no-action known item>
-[Number of items = number of distinct alert groups above]
+:clipboard: Notable Pipelines with ~<count> alerts each:
+• <dag_id>
+[remaining pipelines worth listing]
+
+---
+
+:mag_right: Key Observations & Action Items:
+1. :rotating_light: <top-priority investigation item with pipeline name and why>
+2. :warning: <second item>
+3. :warning: <third item>
+[one numbered item per distinct issue; use :rotating_light: for urgent, :warning: for watch, :pushpin: for FYI, :white_check_mark: for no-action-needed]
+
+---
+
+Would you like me to deep-dive into any specific pipeline or investigate the root cause of the top offenders? :mag:
 
 RULES:
-- Top Noisy Alert: the single highest-volume pipeline+task combo that needs investigation.
-- Known / Low-Concern: delete_view/BQ race (CE-12195, self-resolving), MySQL lock timeout (self-resolving), Disney/SlingTV hourly files delay (by-design monitor). Always include these if they appear in the data.
-- Group remaining alerts by logical category (e.g. "DPI Event Sensor Alerts", "Spark Job Alerts", "k8s Pod Failures") with :large_orange_circle:.
-- Do NOT invent server names, hostnames, CE numbers, or root causes not present in the data or team discussion.
-- Unknown root cause → write: "unknown — needs investigation"
-- Note if root cause is confirmed in #ces-internal-ssd or inferred from alert pattern.
+- Use dag_id names exactly as given — do not shorten or rename.
+- Task type descriptions: trigger_spark_job = "Spark job failures/timeouts"; sensor tasks (start_pipeline_sensor, sensor_*) = "upstream sensor / pipeline wait issues"; copy_and_deliver = "file copy/deliver failures"; trigger_copy_job = "copy job launch failures (k8s/infra)"; delete_view = "BQ view cleanup (CE-12195, self-resolving)"; check_hourly_ssd = "hourly monitor watchdog".
+- Tier pipelines naturally by count: top noisy = clearly highest; mid-range = similar counts in the middle; notable = lower counts worth listing.
+- Do NOT invent pipeline names, counts, server names, CE numbers, or root causes absent from the data or team discussion above.
+- RC context from team discussion should inform Key Observations — cite as "confirmed in #ces-internal-ssd" or "inferred from alert pattern".
 - Output ONLY the Slack message text. No preamble, no code fences."""
 
     summary_text = ""
@@ -2629,13 +2642,13 @@ RULES:
         summary_text = resp.content[0].text.strip()
     except Exception as e:
         logger.error(f"Claude text generation failed: {e}")
-        # Fallback: plain RC counts
         summary_text = (
             f"Here's the weekly SSD alert summary for {date_label}:\n\n"
             f"---\n\n"
-            f":bar_chart: *Weekly SSD Alert Summary — {date_label}*\n"
-            f"Total alerts fired: {total}\n\n"
-            + rc_summary
+            f":bar_chart: Weekly SSD PagerDuty Alert Summary\n"
+            f"Period: {date_label}\n"
+            f"Total Alerts: {total}\n\n"
+            f"Task breakdown:\n{task_lines}"
         )
 
     # ── 5. Post text in chunks ─────────────────────────────────────────────────
