@@ -2071,6 +2071,34 @@ def run_alert_summary_job(
             logger.error(f"Failed to post empty-alert notice: {e}")
         return raw_data
 
+    # Read ces-internal-ssd for team discussion during the same period
+    team_context = ""
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+            hour=23, minute=59, second=59, tzinfo=timezone.utc
+        )
+        ssd_resp = slack_app.client.conversations_history(
+            channel="C07KV3PB79C",
+            oldest=str(start_dt.timestamp()),
+            latest=str(end_dt.timestamp()),
+            limit=200,
+        )
+        msgs = [
+            m.get("text", "").strip()
+            for m in ssd_resp.get("messages", [])
+            if not m.get("bot_id") and m.get("text", "").strip()
+        ]
+        if msgs:
+            team_context = (
+                "\n\nTeam discussion from #ces-internal-ssd during this period "
+                "(use this to enrich root cause context — e.g. if the team identified "
+                "lock timeout, Databricks delay, etc.):\n"
+                + "\n---\n".join(msgs[:60])
+            )
+    except Exception as e:
+        logger.warning(f"Could not read ces-internal-ssd for context: {e}")
+
     try:
         summary_resp = anthropic.messages.create(
             model="claude-sonnet-4-6",
@@ -2085,11 +2113,15 @@ def run_alert_summary_job(
                     f"- Header with total count and date range\n"
                     f"- Top noisy alerts (likely benign, just high volume) — note they're known issues\n"
                     f"- Alerts that may need attention or investigation\n"
-                    f"- Any patterns worth highlighting\n\n"
-                    f"Known recurring noise: delete_view (known, being tracked in CE-12195), "
-                    f"OSG copy_and_deliver lock timeout (known, tracked), "
+                    f"- Any patterns worth highlighting, enriched with team discussion context where available\n\n"
+                    f"IMPORTANT: Only state root causes that are explicitly supported by the alert data or team discussion below. "
+                    f"Do NOT guess or invent specific server names, hostnames, or technical root causes. "
+                    f"If root cause is unknown, say 'root cause unknown — see team discussion' or 'needs investigation'.\n\n"
+                    f"Known recurring noise: delete_view (known, CE-12195), "
+                    f"copy_and_deliver lock timeout (known, tracked), "
                     f"hourly_ssd_monitor_dag (intentional SlingTV/Disney monitor).\n\n"
-                    f"Data:\n{raw_data}"
+                    f"Alert data:\n{raw_data}"
+                    f"{team_context}"
                 ),
             }],
         )
