@@ -161,7 +161,7 @@ active_interleaved_reruns: dict = {}
 # with the exact logical date (failed_minute − 2 mins) and the HDFS output paths.
 
 UPSTREAM_MINUTE_DAG_ID   = "ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG"
-UPSTREAM_MINUTE_INSTANCE = "streamid"   # lives on rke-shared-1 Airflow
+UPSTREAM_MINUTE_INSTANCE = "streamnew"  # moved to streamnew (conviva-airflow.prod.conviva.com); old streamid (rke-shared-1) is PAUSED
 DPI_FLOW_UPSTREAM_OFFSET_MINS = 2       # failed minute X → upstream logical date = X − 2 mins
 # NOTE: HDFS paths are NOT hardcoded here. The bot reads them live from the Confluence
 # playbook (page 4192337966) each time it handles a DPI Flow Feed issue, so path
@@ -2551,10 +2551,10 @@ def run_alert_summary_job(
     except Exception:
         date_label = f"{start_date} – {end_date}"
 
-    # Pipeline-level counts
+    # Pipeline-level counts — no cap, include ALL pipelines
     dag_counts = Counter(a["dag_id"] for a in alerts)
     dag_lines = "\n".join(
-        f"  {dag}: {cnt}" for dag, cnt in dag_counts.most_common(30)
+        f"  {dag}: {cnt}" for dag, cnt in dag_counts.most_common()
     )
     # Task-type counts
     task_type_counts = Counter(a["task_id"] for a in alerts)
@@ -2628,6 +2628,8 @@ RULES:
 - Use dag_id names exactly as given — do not shorten or rename.
 - Task type descriptions: trigger_spark_job = "Spark job failures/timeouts"; sensor tasks (start_pipeline_sensor, sensor_*) = "upstream sensor / pipeline wait issues"; copy_and_deliver = "file copy/deliver failures"; trigger_copy_job = "copy job launch failures (k8s/infra)"; delete_view = "BQ view cleanup (CE-12195, self-resolving)"; check_hourly_ssd = "hourly monitor watchdog".
 - Tier pipelines naturally by count: top noisy = clearly highest; mid-range = similar counts in the middle; notable = lower counts worth listing.
+- EVERY pipeline in the data above MUST appear in the digest — do not drop or omit any. If a pipeline has 1 alert it still goes in the Notable section.
+- Do NOT invent or compute any numbers, percentages, or summary statistics that are not directly provided in the data above. The only counts you may use are the exact numbers given per dag_id and task_id. Do not write things like "X% untracked" or "Y alerts are long-tail" — you do not have that information.
 - Do NOT invent pipeline names, counts, server names, CE numbers, or root causes absent from the data or team discussion above.
 - RC context from team discussion should inform Key Observations — cite as "confirmed in #ces-internal-ssd" or "inferred from alert pattern".
 - Output ONLY the Slack message text. No preamble, no code fences."""
@@ -4066,7 +4068,7 @@ DETECTION — The following are ALL indicators of this issue, regardless of phra
   Do NOT run the generic full pipeline health check (Steps A–F) for this issue.
 
 When a minute-level DPI Flow Feed pipeline is stuck/failed at its first sensor task due to missing upstream data:
-1. The fix is to trigger ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG on streamid Airflow.
+1. The fix is to trigger ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG on streamnew Airflow (conviva-airflow.prod.conviva.com). The old streamid instance (rke-shared-1) is PAUSED — do NOT use it.
 2. The upstream logical date = failed_minute − 2 mins.
 3. HDFS paths MUST be read live from the Confluence playbook — they are NOT hardcoded in the bot.
 
@@ -4624,7 +4626,7 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
                     f"*DAG:* `{trigger['dag_id']}`\n"
                     f"*Logical date:* `{trigger['logical_date']}`\n\n"
                     f"Monitor it at: "
-                    f"<https://rke-shared-1.iad4.prod.conviva.com/conviva-airflow-v2/airflow/dags/"
+                    f"<https://conviva-airflow.prod.conviva.com/dags/"
                     f"{trigger['dag_id']}/grid|{trigger['dag_id']}>\n\n"
                     f"Once it succeeds, rerun your DPI Flow Feed pipelines for minute `{trigger['failed_minute']}`."
                 ),
