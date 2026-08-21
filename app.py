@@ -1545,6 +1545,7 @@ def _airflow_trigger_dag_run(base: str, dag_id: str, dag_run_id: str,
 def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
                                               cross_page_hdfs_path: str,
                                               event_summary_hdfs_path: str,
+                                              upstream_airflow_base_url: str,
                                               channel: str = "", thread_ts: str = "",
                                               user: str = "", client=None) -> str:
     """Stage triggering ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG for human confirmation.
@@ -1555,15 +1556,14 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
     and builds the HDFS config JSON using the paths passed in from Confluence.
 
     Args:
-        failed_minute:            The failed DPI Flow Feed minute e.g. '2026-05-22 21:10:00'
-        cross_page_hdfs_path:     Full hdfs:// base path read from Confluence playbook
-        event_summary_hdfs_path:  Full hdfs:// base path read from Confluence playbook
+        failed_minute:              The failed DPI Flow Feed minute e.g. '2026-05-22 21:10:00'
+        cross_page_hdfs_path:       Full hdfs:// base path read from Confluence playbook
+        event_summary_hdfs_path:    Full hdfs:// base path read from Confluence playbook
+        upstream_airflow_base_url:  Base URL of the Airflow instance, read from Confluence playbook
+                                    e.g. 'https://conviva-airflow.prod.conviva.com'
     """
-    if UPSTREAM_MINUTE_INSTANCE not in AIRFLOW_INSTANCES:
-        return (
-            f"Upstream DAG instance '{UPSTREAM_MINUTE_INSTANCE}' is not configured. "
-            f"Add AIRFLOW_{UPSTREAM_MINUTE_INSTANCE.upper()}_URL to .env"
-        )
+    if not upstream_airflow_base_url:
+        return "upstream_airflow_base_url is required — read it from the Confluence playbook (page 4192337966)."
 
     # Parse the failed minute
     try:
@@ -1577,7 +1577,7 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
     dag_run_id      = f"manual__{upstream_dt_str}"
 
     # ── Check if a run already exists for this exact minute ──
-    base = AIRFLOW_INSTANCES[UPSTREAM_MINUTE_INSTANCE]
+    base = upstream_airflow_base_url.rstrip("/")
     # Use a 1-second window to match only this exact minute's run
     window_end = (upstream_dt + timedelta(seconds=59)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     existing_runs = _airflow_get_dag_runs_in_range(base, UPSTREAM_MINUTE_DAG_ID,
@@ -1622,7 +1622,6 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
     # Store for confirmation
     pending_trigger_upstream[(channel, user)] = {
         "dag_id":        UPSTREAM_MINUTE_DAG_ID,
-        "instance":      UPSTREAM_MINUTE_INSTANCE,
         "base":          base,
         "dag_run_id":    dag_run_id,
         "logical_date":  upstream_dt_str,
@@ -1640,7 +1639,7 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
                 f"*Failed DPI Flow Feed minute:* `{failed_minute}`\n"
                 f"*Upstream logical date (−{DPI_FLOW_UPSTREAM_OFFSET_MINS} min):* `{upstream_dt_str}`\n"
                 f"*DAG:* `{UPSTREAM_MINUTE_DAG_ID}`\n"
-                f"*Instance:* {UPSTREAM_MINUTE_INSTANCE} Airflow\n\n"
+                f"*Airflow:* {base}\n\n"
                 f"{existing_note}"
                 f"*Config JSON:*\n```{conf_str}```\n\n"
                 f"Reply *yes* to trigger, or *no* to cancel."
@@ -3333,10 +3332,10 @@ AGENT_TOOLS = [
         "description": (
             "Propose triggering the upstream minute DAG (ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG) "
             "to fix a DPI Flow Feed pipeline that is stuck/failed at the sensor task due to missing upstream data. "
-            "Accepts the FAILED minute and HDFS paths (read from Confluence page 4192337966). "
+            "Accepts the FAILED minute, HDFS paths, and upstream Airflow base URL — all read from Confluence page 4192337966. "
             "Automatically subtracts 2 minutes for the upstream logical date and builds the correct HDFS config JSON. "
             "Shows a preview and waits for yes/no before triggering. "
-            "Paths must be read from Confluence page 4192337966 first — do NOT hardcode them."
+            "ALL parameters must be read from Confluence page 4192337966 — do NOT hardcode any of them."
         ),
         "input_schema": {
             "type": "object",
@@ -3356,8 +3355,19 @@ AGENT_TOOLS = [
                     "type": "string",
                     "description": "Full hdfs:// base path for ecoEventSummary, read from Confluence page 4192337966 config JSON.",
                 },
+                "upstream_airflow_base_url": {
+                    "type": "string",
+                    "description": (
+                        "Base URL of the Airflow instance that hosts ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG, "
+                        "read from the Confluence playbook (page 4192337966). "
+                        "Extract from the upstream DAG link in the runbook — e.g. if the link is "
+                        "'https://conviva-airflow.prod.conviva.com/dags/ECO_.../grid', "
+                        "the base URL is 'https://conviva-airflow.prod.conviva.com'. "
+                        "Do NOT hardcode this value."
+                    ),
+                },
             },
-            "required": ["failed_minute", "cross_page_hdfs_path", "event_summary_hdfs_path"],
+            "required": ["failed_minute", "cross_page_hdfs_path", "event_summary_hdfs_path", "upstream_airflow_base_url"],
         },
     },
     {
@@ -3714,6 +3724,7 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             failed_minute=inputs["failed_minute"],
             cross_page_hdfs_path=inputs["cross_page_hdfs_path"],
             event_summary_hdfs_path=inputs["event_summary_hdfs_path"],
+            upstream_airflow_base_url=inputs["upstream_airflow_base_url"],
             channel=ctx.get("channel", ""),
             thread_ts=ctx.get("thread_ts", ""),
             user=ctx.get("user", ""),
@@ -4068,9 +4079,9 @@ DETECTION — The following are ALL indicators of this issue, regardless of phra
   Do NOT run the generic full pipeline health check (Steps A–F) for this issue.
 
 When a minute-level DPI Flow Feed pipeline is stuck/failed at its first sensor task due to missing upstream data:
-1. The fix is to trigger ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG on streamnew Airflow (conviva-airflow.prod.conviva.com). The old streamid instance (rke-shared-1) is PAUSED — do NOT use it.
+1. The fix is to trigger ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG. The Airflow instance and URL MUST be read from the Confluence playbook — do NOT hardcode any URL or instance name.
 2. The upstream logical date = failed_minute − 2 mins.
-3. HDFS paths MUST be read live from the Confluence playbook — they are NOT hardcoded in the bot.
+3. HDFS paths AND the upstream Airflow URL MUST be read live from the Confluence playbook — they are NOT hardcoded in the bot.
 
 Workflow — ALWAYS follow this exact order:
   1. Call read_confluence_page with page_id="4192337966" to get the current playbook.
@@ -4078,13 +4089,16 @@ Workflow — ALWAYS follow this exact order:
        - cross_page_hdfs_path: the hdfs:// path for ecoCrossPageFlow from the config JSON example
        - event_summary_hdfs_path: the hdfs:// path for ecoEventSummary from the config JSON example
        - namenode_http: the HTTP host from the HDFS explorer URLs (e.g. http://rccp408-24a.iad6.prod.conviva.com:50070)
+       - upstream_airflow_base_url: the base URL of the Airflow instance from the upstream DAG link in the runbook
+         (e.g. if the runbook shows 'https://conviva-airflow.prod.conviva.com/dags/ECO_.../grid', extract 'https://conviva-airflow.prod.conviva.com')
+         Do NOT guess or hardcode this — read it from the page every time.
   3. Call check_hdfs_minute_data(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, namenode_http).
-  4. If BOTH paths are ready → call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path) IMMEDIATELY.
+  4. If BOTH paths are ready → call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, upstream_airflow_base_url) IMMEDIATELY.
      Do NOT ask "shall I propose the trigger?" — just call the tool. The tool shows a preview and waits for yes/no itself.
   5. If either path is NOT ready → tell the user data is missing, they should contact the TLB team. Do NOT propose the trigger.
   6. If the user explicitly says "trigger anyway" despite missing data → warn them clearly, then propose.
 
-IMPORTANT: Never hardcode HDFS paths. Always read them from Confluence page 4192337966 first.
+IMPORTANT: Never hardcode HDFS paths or Airflow URLs. Always read them from Confluence page 4192337966 first.
 If the page cannot be read, tell the user to check the playbook manually before proceeding.
 
 Triggers: task name contains "sensor_eco_cross_page_event_summary_ssd_minute", DAG name contains "_ECO_SSD_"
@@ -4626,8 +4640,7 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
                     f"*DAG:* `{trigger['dag_id']}`\n"
                     f"*Logical date:* `{trigger['logical_date']}`\n\n"
                     f"Monitor it at: "
-                    f"<https://conviva-airflow.prod.conviva.com/dags/"
-                    f"{trigger['dag_id']}/grid|{trigger['dag_id']}>\n\n"
+                    f"<{trigger['base']}/dags/{trigger['dag_id']}/grid|{trigger['dag_id']}>\n\n"
                     f"Once it succeeds, rerun your DPI Flow Feed pipelines for minute `{trigger['failed_minute']}`."
                 ),
             )
