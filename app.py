@@ -337,6 +337,26 @@ def _pd_alert_to_question(parsed: dict) -> str:
 
     pd_ref = f"\nPagerDuty incident: {pd_url}" if pd_url else ""
 
+    # ── DPI Flow Feed sensor failure — specialized fast-path ──
+    if "sensor_eco_cross_page_event_summary_ssd_minute" in task_id:
+        return (
+            f"DPI Flow Feed sensor failure alert:{pd_ref}\n"
+            f"- Stuck flow feed DAG: `{dag_id}`\n"
+            f"- Failing sensor task: `{task_id}`\n"
+            f"- Stuck minute: `{exec_date}`\n"
+            f"- Task state: `{state}`\n\n"
+            f"This is a DPI Flow Feed stuck-at-sensor issue. Run the fix workflow:\n"
+            f"1. Call get_flow_feed_failures_at_minute(stuck_minute=`{exec_date}`) to find ALL "
+            f"pipelines stuck at this minute from #piccolo-daas-alert — not just this one.\n"
+            f"2. Read Confluence page 4192337966 for HDFS paths and upstream Airflow URL.\n"
+            f"3. Check HDFS success flag for upstream minute (stuck minute − 2 min).\n"
+            f"4. Propose triggering ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG.\n"
+            f"5. After the upstream trigger proposal, propose rerunning ALL stuck flow feed DAGs "
+            f"found in step 1 for minute `{exec_date}` — one propose_rerun_dag_runs call per DAG "
+            f"(start_date=`{exec_date}`, end_date=`{exec_date}`). If step 1 found no others, "
+            f"just rerun `{dag_id}`."
+        )
+
     return (
         f"PagerDuty alert received for pipeline `{dag_id}`:{pd_ref}\n"
         f"- Failing task: `{task_id}`\n"
@@ -1546,6 +1566,7 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
                                               cross_page_hdfs_path: str,
                                               event_summary_hdfs_path: str,
                                               upstream_airflow_base_url: str,
+                                              force: bool = False,
                                               channel: str = "", thread_ts: str = "",
                                               user: str = "", client=None) -> str:
     """Stage triggering ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG for human confirmation.
@@ -1628,7 +1649,13 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
         "conf":          conf,
         "failed_minute": failed_minute,
         "thread_ts":     thread_ts,
+        "force":         force,
     }
+
+    force_warning = (
+        "⚠️ *Warning: success flag (_SUCCESS) was NOT found in HDFS.* "
+        "Triggering without confirmed upstream data — the downstream pipeline may still fail if data is truly missing.\n\n"
+    ) if force else ""
 
     if client:
         client.chat_postMessage(
@@ -1640,6 +1667,7 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
                 f"*Upstream logical date (−{DPI_FLOW_UPSTREAM_OFFSET_MINS} min):* `{upstream_dt_str}`\n"
                 f"*DAG:* `{UPSTREAM_MINUTE_DAG_ID}`\n"
                 f"*Airflow:* {base}\n\n"
+                f"{force_warning}"
                 f"{existing_note}"
                 f"*Config JSON:*\n```{conf_str}```\n\n"
                 f"Reply *yes* to trigger, or *no* to cancel."
@@ -2226,6 +2254,83 @@ def _generate_rc_chart(alerts: list, start_date: str, end_date: str) -> bytes:
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+def tool_get_flow_feed_failures_at_minute(stuck_minute: str) -> str:
+    """Query #piccolo-daas-alert (C03KA6FQR1C) for ALL DPI Flow Feed pipelines that failed
+    at the same stuck minute. Use this when a flow feed sensor failure is detected to find
+    all other pipelines that need the same fix — so reruns can be proposed in batch.
+
+    Args:
+        stuck_minute: The failed minute from the DPI Flow Feed alert,
+                      e.g. '2026-08-26T19:14:00+00:00' or '2026-08-26 19:14:00'.
+                      The execution_date in the alert IS the stuck minute.
+    Returns:
+        List of all unique DAG IDs stuck at this minute with sensor_eco_cross_page_event_summary_ssd_minute.
+    """
+    ALERT_CHANNEL = "C03KA6FQR1C"
+    try:
+        stuck_dt = datetime.fromisoformat(_normalise_dt(stuck_minute)).replace(tzinfo=timezone.utc)
+    except Exception as e:
+        return f"Could not parse stuck_minute '{stuck_minute}': {e}"
+
+    # Search a ±2 hour window around the stuck minute (alerts may arrive late)
+    search_start = (stuck_dt - timedelta(hours=2)).timestamp()
+    search_end   = (stuck_dt + timedelta(hours=2)).timestamp()
+
+    found_dags: dict[str, str] = {}  # dag_id → execution_date
+    cursor = None
+    for _ in range(10):
+        params = {
+            "channel": ALERT_CHANNEL,
+            "limit":   200,
+            "oldest":  str(search_start),
+            "latest":  str(search_end),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            resp = slack_app.client.conversations_history(**params)
+        except Exception as e:
+            logger.warning(f"tool_get_flow_feed_failures_at_minute: Slack error: {e}")
+            break
+        for msg in resp.get("messages", []):
+            text = msg.get("text", "")
+            if "sensor_eco_cross_page_event_summary_ssd_minute" not in text:
+                continue
+            parsed = _parse_pd_alert_message(text, msg.get("ts", ""))
+            if not parsed:
+                continue
+            exec_date_str = parsed.get("execution_date", "")
+            try:
+                exec_dt = datetime.fromisoformat(_normalise_dt(exec_date_str)).replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            # Match only alerts at the exact same minute
+            if exec_dt == stuck_dt:
+                found_dags[parsed["dag_id"]] = exec_date_str
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+
+    if not found_dags:
+        return (
+            f"No flow feed sensor failures found in #piccolo-daas-alert for minute `{stuck_minute}`. "
+            f"Only the originally reported DAG needs rerun, or the alert may not have been posted yet."
+        )
+
+    lines = [
+        f"*Flow feed sensor failures at minute `{stuck_minute}` in #piccolo-daas-alert:*\n",
+        f"Found *{len(found_dags)}* stuck pipeline(s):\n",
+    ]
+    for dag_id in sorted(found_dags):
+        lines.append(f"  • `{dag_id}`")
+    lines.append(
+        f"\nPropose rerunning ALL {len(found_dags)} pipeline(s) for minute `{stuck_minute}`."
+    )
+    return "\n".join(lines)
 
 
 def tool_read_ssd_alerts(start_date: str = None, end_date: str = None) -> str:
@@ -3366,6 +3471,14 @@ AGENT_TOOLS = [
                         "Do NOT hardcode this value."
                     ),
                 },
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "Set to true when triggering WITHOUT a confirmed _SUCCESS flag in HDFS — "
+                        "i.e. the user explicitly chose to proceed despite missing upstream data. "
+                        "The proposal message will show a clear warning. Default is false."
+                    ),
+                },
             },
             "required": ["failed_minute", "cross_page_hdfs_path", "event_summary_hdfs_path", "upstream_airflow_base_url"],
         },
@@ -3585,6 +3698,28 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "get_flow_feed_failures_at_minute",
+        "description": (
+            "Query #piccolo-daas-alert to find ALL DPI Flow Feed pipelines that failed at the same "
+            "stuck minute. Call this when a flow feed sensor failure is detected so you can propose "
+            "a batch rerun for ALL affected pipelines at once, not just the one in the alert. "
+            "Returns the list of unique DAG IDs stuck at that minute."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stuck_minute": {
+                    "type": "string",
+                    "description": (
+                        "The execution_date from the failed TaskInstance alert — this is the stuck minute. "
+                        "e.g. '2026-08-26T19:14:00+00:00' or '2026-08-26 19:14:00'."
+                    ),
+                },
+            },
+            "required": ["stuck_minute"],
+        },
+    },
+    {
         "name": "read_ssd_alerts",
         "description": (
             "Read and parse SSD PagerDuty alerts from #piccolo-daas-alert for a given date range, "
@@ -3725,6 +3860,7 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             cross_page_hdfs_path=inputs["cross_page_hdfs_path"],
             event_summary_hdfs_path=inputs["event_summary_hdfs_path"],
             upstream_airflow_base_url=inputs["upstream_airflow_base_url"],
+            force=inputs.get("force", False),
             channel=ctx.get("channel", ""),
             thread_ts=ctx.get("thread_ts", ""),
             user=ctx.get("user", ""),
@@ -3760,6 +3896,8 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             user=ctx.get("user", ""),
             client=ctx.get("client"),
         )
+    if name == "get_flow_feed_failures_at_minute":
+        return tool_get_flow_feed_failures_at_minute(inputs["stuck_minute"])
     if name == "read_ssd_alerts":
         return tool_read_ssd_alerts(inputs["start_date"], inputs["end_date"])
     if name == "lookup_pipeline":
@@ -3916,18 +4054,18 @@ Step 1 — Check CID_HHID and CID_Community for the affected TZ:
 
 Step 2 — Check the shared Databricks job IP_Classification_ConvivaIdJob:
   • Both CID_Community_TZ_N4 and CID_Community_TZ_N7 depend on this Databricks job.
-  • Link: https://6189788464754029.9.gcp.databricks.com/jobs/36751?o=6189788464754029
+  • For the current Databricks link, read the StreamID section of the SSD Playbook: https://conviva.atlassian.net/wiki/spaces/CSS/pages/2584412251/SSD+Playbook+for+Support
   • Tell the user to check this job manually (bot cannot access Databricks directly).
   • If this job also failed → Step 3.
 
 Step 3 — Check CID_IP_Classifier_Features:
   • call get_airflow_dag_runs for CID_IP_Classifier_Features (instance="streamid")
-  • Link: https://rke-shared-1.iad4.prod.conviva.com/conviva-airflow-v2/airflow/dags/CID_IP_Classifier_Features/grid
+  • For the current Airflow link, read the StreamID section of the SSD Playbook: https://conviva.atlassian.net/wiki/spaces/CSS/pages/2584412251/SSD+Playbook+for+Support
   • If this also failed → Step 4.
 
 Step 4 — Check PBSS.d data:
-  • PBSS.D Airflow DAG: https://rke-shared-1.iad4.prod.conviva.com/conviva-airflow-v2/airflow/dags/d3_ss_merge_daily/grid
   • call get_airflow_dag_runs for d3_ss_merge_daily (instance="streamid")
+  • For the current Airflow link, read the StreamID section of the SSD Playbook: https://conviva.atlassian.net/wiki/spaces/CSS/pages/2584412251/SSD+Playbook+for+Support
   • If PBSS data not ready → escalate to DS team / Po-Han Tseng.
   • If PBSS data IS ready → propose rerunning jobs from upstream to downstream:
     CID_IP_Classifier_Features → CID_Community_TZ_Nx → CID_HHID_TZ_Nx → SSD pipelines.
@@ -3963,9 +4101,9 @@ PIPELINE REFERENCE TABLE:
      HDFS: rccp103-2d.iad5.prod.conviva.com:50070  path: /tmp/mapped_event_ssd/cust=1960184865
 
 UPSTREAM PIPELINE:
-  ECO_Event_Hourly on streamid Airflow:
-  https://rke-shared-1.iad4.prod.conviva.com/conviva-airflow-v2/airflow/dags/ECO_Event_Hourly
-  All 4 DPI Event pipelines depend on this. If it's delayed, the downstream sensors will be stuck.
+  ECO_Event_Hourly: All 4 DPI Event pipelines depend on this. If it's delayed, the downstream sensors will be stuck.
+  For Airflow links and current pipeline details, read the Confluence runbook:
+  https://conviva.atlassian.net/wiki/spaces/CSS/pages/4413751422/DPI+Event+Feeds+for+SlingTV
 
 CRITICAL — RUN-ID TO DATA-HOUR OFFSET:
   Each pipeline's job does NOT deliver data for the hour it runs. The actual data hour is:
@@ -4084,6 +4222,9 @@ When a minute-level DPI Flow Feed pipeline is stuck/failed at its first sensor t
 3. HDFS paths AND the upstream Airflow URL MUST be read live from the Confluence playbook — they are NOT hardcoded in the bot.
 
 Workflow — ALWAYS follow this exact order:
+  0. If triggered by a TaskInstance alert (sensor_eco_cross_page_event_summary_ssd_minute):
+     Call get_flow_feed_failures_at_minute(stuck_minute=<exec_date>) FIRST to discover all pipelines
+     stuck at this minute in #piccolo-daas-alert. Remember the full list for step 4a.
   1. Call read_confluence_page with page_id="4192337966" to get the current playbook.
   2. From the page, extract:
        - cross_page_hdfs_path: the hdfs:// path for ecoCrossPageFlow from the config JSON example
@@ -4095,8 +4236,16 @@ Workflow — ALWAYS follow this exact order:
   3. Call check_hdfs_minute_data(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, namenode_http).
   4. If BOTH paths are ready → call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, upstream_airflow_base_url) IMMEDIATELY.
      Do NOT ask "shall I propose the trigger?" — just call the tool. The tool shows a preview and waits for yes/no itself.
-  5. If either path is NOT ready → tell the user data is missing, they should contact the TLB team. Do NOT propose the trigger.
-  6. If the user explicitly says "trigger anyway" despite missing data → warn them clearly, then propose.
+     4a. After proposing the upstream trigger, also call propose_rerun_dag_runs for EACH stuck flow feed
+         DAG found in step 0 (start_date=failed_minute, end_date=failed_minute).
+         If step 0 found N DAGs, make N separate propose_rerun_dag_runs calls, one per DAG.
+         Tell the user: "Once the upstream DAG succeeds, confirm each rerun below to retry all stuck flow feed pipelines."
+         If step 0 was not run (user typed manually, not from an alert), only rerun the DAG mentioned by the user.
+  5. If either path is NOT ready → tell the user data is missing, they should contact the TLB team.
+     Also offer: "If you'd like to trigger anyway without waiting for the success flag, reply *force trigger*."
+     If the user confirms they want to force trigger → call propose_trigger_upstream_minute_dag(..., force=True).
+     The proposal will show a clear warning that data was not confirmed.
+  6. If the user explicitly says "trigger anyway" or "force trigger" despite missing data → call propose_trigger_upstream_minute_dag(..., force=True) immediately.
 
 IMPORTANT: Never hardcode HDFS paths or Airflow URLs. Always read them from Confluence page 4192337966 first.
 If the page cannot be read, tell the user to check the playbook manually before proceeding.
