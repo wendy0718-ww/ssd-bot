@@ -4644,8 +4644,19 @@ def handle_answer(question: str, client, channel: str, thread_ts: str, user: str
         # Context passed to write tools (propose_confluence_update etc.)
         tool_ctx = {"channel": channel, "thread_ts": thread_ts, "user": user, "client": client}
 
+        # Tools that post their own Slack message (proposal previews) — when any of
+        # these fire, suppress Claude's final text reply so there's no duplicate.
+        TOOLS_THAT_POST = {
+            "propose_hdfs_to_s3_repair",
+            "propose_rerun_dag_runs",
+            "propose_trigger_upstream_minute_dag",
+            "propose_confluence_update",
+            "propose_new_confluence_page",
+        }
+
         # ── Agentic loop: Claude calls tools until it has enough to answer ──
         answer = ""  # ensure always defined even if loop exits unexpectedly
+        tool_posted_to_slack = False
         for _ in range(10):  # max 10 tool calls per question
             resp = anthropic.messages.create(
                 model="claude-sonnet-4-6",
@@ -4670,6 +4681,8 @@ def handle_answer(question: str, client, channel: str, thread_ts: str, user: str
                         logger.info(f"Agent calling tool: {block.name}({block.input})")
                         result = execute_tool(block.name, block.input, **tool_ctx)
                         sources.append(block.name)
+                        if block.name in TOOLS_THAT_POST:
+                            tool_posted_to_slack = True
                         tool_results.append({
                             "type":        "tool_result",
                             "tool_use_id": block.id,
@@ -4707,12 +4720,20 @@ def handle_answer(question: str, client, channel: str, thread_ts: str, user: str
         used = list(dict.fromkeys(source_labels[s] for s in sources if s in source_labels))
         source_line = ("_Sources: " + ", ".join(used) + "_") if used else ""
 
-        _slack_reply(
-            client,
-            channel=channel, thread_ts=thread_ts,
-            text=f"🤖 *SSD Bot*\n\n{answer}\n\n{source_line}".strip(),
-            update_ts=ack["ts"],
-        )
+        if tool_posted_to_slack:
+            # The proposal tool already posted its own Slack message — just delete
+            # the "Researching…" ack so there's no duplicate or orphaned spinner.
+            try:
+                client.chat_delete(channel=channel, ts=ack["ts"])
+            except Exception:
+                pass
+        else:
+            _slack_reply(
+                client,
+                channel=channel, thread_ts=thread_ts,
+                text=f"🤖 *SSD Bot*\n\n{answer}\n\n{source_line}".strip(),
+                update_ts=ack["ts"],
+            )
 
         # ── Save this exchange to thread history ──
         history = thread_history.get(thread_ts, [])
@@ -5376,6 +5397,12 @@ def handle_message_events(body, event, client, logger):
     ts        = event["ts"]
     user      = event.get("user", "")
     text      = event["text"].strip()
+
+    # @mention messages fire both app_mention and message events — handle them
+    # exclusively in app_mention to avoid double-processing (duplicate replies,
+    # "no pending action" false positives, etc.)
+    if re.search(r"<@[A-Z0-9]+>", text):
+        return
 
     if channel not in TARGET_CHANNELS:
         return
