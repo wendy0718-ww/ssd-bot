@@ -151,9 +151,19 @@ pending_hdfs_s3_copy: dict = {}
 # AWS profile map: S3 bucket prefix → credentials profile in ~/.aws/credentials
 AWS_S3_PROFILE_MAP = {
     "conviva-daas-dev": "daas-dev",
+    "p-conviva-v2":       "sling",   # EchoStar-SlingTV DPI Event pipelines
     "p-conviva-onstream": "sling",
-    "p-conviva-slingtv": "sling",
+    "p-conviva-slingtv":  "sling",
     "p-conviva-echostar": "sling",
+}
+
+# S3 buckets where Conviva does NOT have delete permission (SlingTV / EchoStar-OnStream).
+# Pipelines writing to these buckets cannot be rerun to redeliver — a _repair copy is needed.
+NO_DELETE_S3_BUCKETS = {
+    "p-conviva-v2",
+    "p-conviva-onstream",
+    "p-conviva-slingtv",
+    "p-conviva-echostar",
 }
 
 # Pending backfill-mark-success (bypasses max_active_runs) awaiting human confirmation
@@ -2308,6 +2318,91 @@ def _webhdfs_list_files(namenode: str, path: str) -> list:
     return files
 
 
+def _webhdfs_list_files_with_sizes(namenode: str, path: str) -> list:
+    """Recursively list files with sizes: returns list of (hdfs_path, size_bytes)."""
+    url = f"{namenode}/webhdfs/v1{path}?op=LISTSTATUS"
+    resp = requests.get(url, verify=False, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"WebHDFS LISTSTATUS {url} → {resp.status_code}: {resp.text[:200]}")
+    files = []
+    for item in resp.json().get("FileStatuses", {}).get("FileStatus", []):
+        name = item["pathSuffix"]
+        item_path = f"{path.rstrip('/')}/{name}"
+        if item["type"] == "FILE":
+            files.append((item_path, item.get("length", 0)))
+        elif item["type"] == "DIRECTORY":
+            files.extend(_webhdfs_list_files_with_sizes(namenode, item_path))
+    return files
+
+
+def tool_check_s3_vs_hdfs(hdfs_url: str, s3_url: str) -> str:
+    """Compare file count and total size between an HDFS path and an S3 path.
+
+    Returns a verdict: complete (S3 matches HDFS), partial (S3 has fewer/smaller files),
+    or empty (S3 has nothing). Used to determine whether a repair copy is needed.
+    """
+    try:
+        namenode, hdfs_path = _parse_hdfs_url_to_webhdfs(hdfs_url)
+    except ValueError as e:
+        return f"Cannot parse HDFS URL: {e}"
+    try:
+        s3_bucket, s3_prefix = _s3_parse_url(s3_url)
+    except ValueError as e:
+        return f"Cannot parse S3 URL: {e}"
+
+    # ── HDFS side ──
+    try:
+        hdfs_files = _webhdfs_list_files_with_sizes(namenode, hdfs_path)
+    except Exception as e:
+        return f"Failed to list HDFS files: {e}"
+
+    if not hdfs_files:
+        return "HDFS path is empty — no data to deliver."
+
+    hdfs_count = len(hdfs_files)
+    hdfs_bytes = sum(sz for _, sz in hdfs_files)
+
+    # ── S3 side ──
+    try:
+        import boto3
+        aws_profile = _aws_profile_for_bucket(s3_bucket)
+        session   = boto3.Session(profile_name=aws_profile)
+        s3_client = session.client("s3")
+        paginator = s3_client.get_paginator("list_objects_v2")
+        s3_files  = []
+        for page in paginator.paginate(Bucket=s3_bucket,
+                                       Prefix=s3_prefix.rstrip("/") + "/"):
+            for obj in page.get("Contents", []):
+                s3_files.append((obj["Key"], obj["Size"]))
+    except Exception as e:
+        return f"Failed to list S3 files: {e}"
+
+    s3_count = len(s3_files)
+    s3_bytes  = sum(sz for _, sz in s3_files)
+
+    # ── Verdict ──
+    if s3_count == 0:
+        verdict = "EMPTY"
+        detail  = "S3 folder has no files — upload never started or was fully cleaned up."
+    elif s3_count == hdfs_count and s3_bytes == hdfs_bytes:
+        verdict = "COMPLETE"
+        detail  = "S3 matches HDFS exactly — upload completed successfully."
+    else:
+        missing = hdfs_count - s3_count
+        verdict = "PARTIAL"
+        detail  = (
+            f"S3 is incomplete — {s3_count}/{hdfs_count} files, "
+            f"{s3_bytes:,}/{hdfs_bytes:,} bytes. "
+            f"{missing} file(s) missing."
+        )
+
+    return (
+        f"HDFS: {hdfs_count} files, {hdfs_bytes:,} bytes\n"
+        f"S3:   {s3_count} files, {s3_bytes:,} bytes\n"
+        f"Verdict: {verdict} — {detail}"
+    )
+
+
 def _s3_parse_url(s3_url: str) -> tuple:
     """Parse s3://bucket/prefix → (bucket, prefix)."""
     m = re.match(r"s3a?://([^/]+)/?(.*)$", s3_url.strip().rstrip("/"))
@@ -3831,6 +3926,36 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "check_s3_vs_hdfs",
+        "description": (
+            "Compare file count and total size between an HDFS staging path and an S3 destination path. "
+            "Use this to determine whether an S3 upload completed successfully, was partial, or never started. "
+            "Returns a verdict: COMPLETE (S3 matches HDFS), PARTIAL (fewer/smaller files in S3), "
+            "or EMPTY (nothing in S3). "
+            "Call this after finding a 'move hdfs://... to s3a://...' line in a task log, before deciding "
+            "whether to propose a rerun or a repair copy."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hdfs_url": {
+                    "type": "string",
+                    "description": (
+                        "HDFS source URL in any format: "
+                        "http://namenode:50070/webhdfs/v1/path, "
+                        "http://namenode:50070/explorer.html#/path, or "
+                        "hdfs://namenode:8020/path"
+                    ),
+                },
+                "s3_url": {
+                    "type": "string",
+                    "description": "S3 destination URL, e.g. s3://bucket/prefix or s3a://bucket/prefix",
+                },
+            },
+            "required": ["hdfs_url", "s3_url"],
+        },
+    },
+    {
         "name": "propose_hdfs_to_s3_repair",
         "description": (
             "Propose copying files from an HDFS path to an S3 path for manual repair/delivery. "
@@ -4057,6 +4182,11 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             thread_ts=ctx.get("thread_ts", ""),
             user=ctx.get("user", ""),
             client=ctx.get("client"),
+        )
+    if name == "check_s3_vs_hdfs":
+        return tool_check_s3_vs_hdfs(
+            hdfs_url=inputs["hdfs_url"],
+            s3_url=inputs["s3_url"],
         )
     if name == "propose_hdfs_to_s3_repair":
         return tool_propose_hdfs_to_s3_repair(
@@ -4621,7 +4751,45 @@ If no results are found, say so and suggest the user file a new ticket if the is
   Triggers: "publish a new page", "create a page", "write a Confluence page", "post this as a new page".
 - For both tools: summarise all relevant context from the conversation into the content — don't say "what I said above".
 - Both tools show a preview to the user and ask for yes/no. Do NOT ask for confirmation yourself — just call
-  the tool and tell the user to reply yes or no."""
+  the tool and tell the user to reply yes or no.
+
+━━━ NO-DELETE S3 BUCKETS — REPAIR COPY INSTEAD OF RERUN ━━━
+SlingTV / EchoStar-OnStream pipelines write to buckets where Conviva has NO delete permission:
+  • s3://p-conviva-v2/      (EchoStar-SlingTV DPI Event)
+  • s3://p-conviva-onstream/ (EchoStar-OnStream Connect pipelines)
+  • s3://p-conviva-slingtv/
+  • s3://p-conviva-echostar/
+
+When a pipeline that writes to one of these buckets fails, follow this decision tree:
+
+  Step 1 — Read the task log and look for: "move hdfs://HOST/PATH to s3a://BUCKET/PREFIX"
+
+  Case A — No "move hdfs://..." line in the log:
+    Upload never started (BQ read failed, HDFS staging failed, etc.)
+    → SAFE TO RERUN. Propose a rerun normally.
+
+  Case B — "move hdfs://..." line found:
+    Data was staged to HDFS and upload was attempted. Call check_s3_vs_hdfs(hdfs_url, s3_url) to compare.
+
+    • Verdict COMPLETE (S3 file count and total bytes match HDFS):
+      → Upload succeeded. Tell the user data is already in S3 — no rerun or repair needed.
+
+    • Verdict PARTIAL (fewer files or smaller total size in S3):
+      → Partial upload. ❌ Do NOT propose rerun (no delete permission).
+      → Add "repair_" prefix to the last segment of the S3 path:
+         s3a://p-conviva-onstream/video_ads/2026-08-30 → s3a://p-conviva-onstream/video_ads/repair_2026-08-30/
+      → Tell the user why, then call propose_hdfs_to_s3_repair(hdfs_url, s3_repair_url).
+
+    • Verdict EMPTY (nothing in S3):
+      → Upload never wrote anything to S3 (connection failed before first file).
+      → This is ambiguous — ask the user whether to rerun or repair-copy.
+
+━━━ HDFS → S3 REPAIR COPY (manual) ━━━
+Use propose_hdfs_to_s3_repair when the user explicitly says things like:
+  "copy files from [hdfs url] to [s3 url]"
+  "manually deliver hdfs data to s3://..."
+  "repair delivery, copy hdfs to s3"
+The tool lists files, shows a preview, and waits for yes/no confirmation."""
 
 
 def handle_answer(question: str, client, channel: str, thread_ts: str, user: str = ""):
