@@ -145,6 +145,17 @@ pending_rerun_runs: dict = {}
 # Pending upstream minute DAG trigger awaiting human confirmation
 pending_trigger_upstream: dict = {}
 
+# Pending HDFS → S3 repair copy awaiting human confirmation
+pending_hdfs_s3_copy: dict = {}
+
+# AWS profile map: S3 bucket prefix → credentials profile in ~/.aws/credentials
+AWS_S3_PROFILE_MAP = {
+    "conviva-daas-dev": "daas-dev",
+    "p-conviva-onstream": "sling",
+    "p-conviva-slingtv": "sling",
+    "p-conviva-echostar": "sling",
+}
+
 # Pending backfill-mark-success (bypasses max_active_runs) awaiting human confirmation
 pending_backfill: dict = {}
 
@@ -547,23 +558,26 @@ def _get_airflow_headers(base: str) -> dict:
 def _airflow_request(base: str, path: str, params: dict = None) -> dict:
     """Try Airflow 2.x REST API, then fall back to 1.x experimental API."""
     headers = _get_airflow_headers(base)
+    # Connect Airflow (airflow-prod.mds.conviva.com) is significantly slower than
+    # the other instances — use a longer timeout to avoid spurious read timeouts.
+    _timeout = 45 if "mds.conviva.com" in base else 15
     # Try v2
     url = f"{base}/api/v1/{path}"
     logger.info(f"Airflow GET {url}")
-    resp = requests.get(url, params=params, headers=headers, verify=False, timeout=15)
+    resp = requests.get(url, params=params, headers=headers, verify=False, timeout=_timeout)
     logger.info(f"  → status={resp.status_code} body={resp.text[:300]!r}")
 
     if resp.status_code == 401:
         # Token may have expired — clear cache and retry once
         _airflow_tokens.pop(base, None)
         headers = _get_airflow_headers(base)
-        resp = requests.get(url, params=params, headers=headers, verify=False, timeout=15)
+        resp = requests.get(url, params=params, headers=headers, verify=False, timeout=_timeout)
 
     if resp.status_code == 404:
         # Try Airflow 1.x experimental API
         url_exp = f"{base}/api/experimental/{path}"
         logger.info(f"Airflow v2 404 — trying experimental {url_exp}")
-        resp = requests.get(url_exp, params=params, headers=headers, verify=False, timeout=15)
+        resp = requests.get(url_exp, params=params, headers=headers, verify=False, timeout=_timeout)
         logger.info(f"  → status={resp.status_code} body={resp.text[:300]!r}")
         if resp.ok:
             data = resp.json()
@@ -2256,6 +2270,125 @@ def _generate_rc_chart(alerts: list, start_date: str, end_date: str) -> bytes:
     return buf.read()
 
 
+def _parse_hdfs_url_to_webhdfs(url: str) -> tuple:
+    """Normalise any HDFS URL variant to (namenode_http, hdfs_path).
+
+    Handles:
+      http://host:50070/webhdfs/v1/path   → (http://host:50070, /path)
+      http://host:50070/explorer.html#/path → (http://host:50070, /path)
+      hdfs://host:8020/path               → (http://host:50070, /path)
+    """
+    url = url.strip().rstrip("/")
+    m = re.match(r"(https?://[^/]+)/webhdfs/v1(/.*)", url)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r"(https?://[^/]+)/explorer\.html#(/.*)", url)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r"hdfs://([^:/]+)(?::\d+)?(/.*)", url)
+    if m:
+        return f"http://{m.group(1)}:50070", m.group(2)
+    raise ValueError(f"Cannot parse HDFS URL: {url}")
+
+
+def _webhdfs_list_files(namenode: str, path: str) -> list:
+    """Recursively list all files (not dirs) under an HDFS path via WebHDFS."""
+    url = f"{namenode}/webhdfs/v1{path}?op=LISTSTATUS"
+    resp = requests.get(url, verify=False, timeout=30)
+    if not resp.ok:
+        raise RuntimeError(f"WebHDFS LISTSTATUS {url} → {resp.status_code}: {resp.text[:200]}")
+    files = []
+    for item in resp.json().get("FileStatuses", {}).get("FileStatus", []):
+        name = item["pathSuffix"]
+        item_path = f"{path.rstrip('/')}/{name}"
+        if item["type"] == "FILE":
+            files.append(item_path)
+        elif item["type"] == "DIRECTORY":
+            files.extend(_webhdfs_list_files(namenode, item_path))
+    return files
+
+
+def _s3_parse_url(s3_url: str) -> tuple:
+    """Parse s3://bucket/prefix → (bucket, prefix)."""
+    m = re.match(r"s3a?://([^/]+)/?(.*)$", s3_url.strip().rstrip("/"))
+    if not m:
+        raise ValueError(f"Cannot parse S3 URL: {s3_url}")
+    return m.group(1), m.group(2).strip("/")
+
+
+def _aws_profile_for_bucket(bucket: str) -> str:
+    """Determine AWS credentials profile from bucket name."""
+    for prefix, profile in AWS_S3_PROFILE_MAP.items():
+        if bucket == prefix or bucket.startswith(prefix):
+            return profile
+    return "default"
+
+
+def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
+                                    channel: str = "", thread_ts: str = "",
+                                    user: str = "", client=None) -> str:
+    """Propose copying files from an HDFS path to an S3 path (repair/manual delivery).
+
+    Uses WebHDFS REST API to stream files directly to S3 via boto3 —
+    no hadoop client or disk space needed on the bot server.
+
+    Args:
+        hdfs_url: HDFS source — any of:
+                  http://namenode:50070/webhdfs/v1/path
+                  http://namenode:50070/explorer.html#/path
+                  hdfs://namenode:8020/path
+        s3_url:   S3 destination — s3://bucket/prefix
+    """
+    try:
+        namenode, hdfs_path = _parse_hdfs_url_to_webhdfs(hdfs_url)
+    except ValueError as e:
+        return f"Cannot parse HDFS URL: {e}"
+    try:
+        s3_bucket, s3_prefix = _s3_parse_url(s3_url)
+    except ValueError as e:
+        return f"Cannot parse S3 URL: {e}"
+
+    aws_profile = _aws_profile_for_bucket(s3_bucket)
+
+    try:
+        files = _webhdfs_list_files(namenode, hdfs_path)
+    except Exception as e:
+        return f"Failed to list HDFS files at `{namenode}{hdfs_path}`: {e}"
+
+    if not files:
+        return f"No files found at `{namenode}{hdfs_path}`."
+
+    pending_hdfs_s3_copy[(channel, user)] = {
+        "namenode":   namenode,
+        "hdfs_path":  hdfs_path,
+        "files":      files,
+        "s3_bucket":  s3_bucket,
+        "s3_prefix":  s3_prefix,
+        "aws_profile": aws_profile,
+        "thread_ts":  thread_ts,
+    }
+
+    sample = files[:8]
+    sample_lines = "\n".join(f"  • `{f.split('/')[-1]}`" for f in sample)
+    if len(files) > 8:
+        sample_lines += f"\n  _... and {len(files) - 8} more_"
+
+    if client:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=(
+                f"📦 *Proposed: HDFS → S3 Repair Copy*\n\n"
+                f"*Source (HDFS):* `{namenode}{hdfs_path}/`\n"
+                f"*Destination (S3):* `s3://{s3_bucket}/{s3_prefix}/`\n"
+                f"*AWS profile:* `{aws_profile}`\n"
+                f"*Files found:* {len(files)}\n\n"
+                f"{sample_lines}\n\n"
+                f"Reply *yes* to start the copy, or *no* to cancel."
+            ),
+        )
+    return f"✅ Preview posted. Found {len(files)} files. Waiting for yes/no."
+
+
 def tool_get_flow_feed_failures_at_minute(stuck_minute: str) -> str:
     """Query #piccolo-daas-alert (C03KA6FQR1C) for ALL DPI Flow Feed pipelines that failed
     at the same stuck minute. Use this when a flow feed sensor failure is detected to find
@@ -3698,6 +3831,35 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "propose_hdfs_to_s3_repair",
+        "description": (
+            "Propose copying files from an HDFS path to an S3 path for manual repair/delivery. "
+            "Use when the user says 'copy files from [hdfs url] to [s3 url]', "
+            "'repair delivery to s3', 'manually deliver hdfs data to s3', or similar. "
+            "Lists the files first and waits for yes/no before copying. "
+            "Streams files via WebHDFS REST API directly to S3 — no hadoop client needed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hdfs_url": {
+                    "type": "string",
+                    "description": (
+                        "HDFS source URL in any format: "
+                        "http://namenode:50070/webhdfs/v1/path, "
+                        "http://namenode:50070/explorer.html#/path, or "
+                        "hdfs://namenode:8020/path"
+                    ),
+                },
+                "s3_url": {
+                    "type": "string",
+                    "description": "S3 destination URL, e.g. s3://bucket/prefix or s3a://bucket/prefix",
+                },
+            },
+            "required": ["hdfs_url", "s3_url"],
+        },
+    },
+    {
         "name": "get_flow_feed_failures_at_minute",
         "description": (
             "Query #piccolo-daas-alert to find ALL DPI Flow Feed pipelines that failed at the same "
@@ -3891,6 +4053,15 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
         return tool_propose_confluence_update(
             content_to_add=inputs["content_to_add"],
             section=inputs.get("section", "Common Issues"),
+            channel=ctx.get("channel", ""),
+            thread_ts=ctx.get("thread_ts", ""),
+            user=ctx.get("user", ""),
+            client=ctx.get("client"),
+        )
+    if name == "propose_hdfs_to_s3_repair":
+        return tool_propose_hdfs_to_s3_repair(
+            hdfs_url=inputs["hdfs_url"],
+            s3_url=inputs["s3_url"],
             channel=ctx.get("channel", ""),
             thread_ts=ctx.get("thread_ts", ""),
             user=ctx.get("user", ""),
@@ -4285,6 +4456,17 @@ or "_DPI_SSD_" or "Cross_Page_SSD", "DPI flow feed for HH:MM is stuck/failing", 
 - This tool auto-detects the DAG schedule, generates ALL logical dates in the range,
   creates missing run records AND patches existing ones to success.
 - Only marks as success. Shows a preview and waits for yes/no.
+
+━━━ HDFS → S3 REPAIR COPY ━━━
+
+Use propose_hdfs_to_s3_repair when the user says things like:
+  "copy files from [hdfs url] to [s3 url]"
+  "manually deliver hdfs data to s3://..."
+  "repair delivery, copy hdfs to s3"
+
+The tool accepts any HDFS URL format (webhdfs, explorer, hdfs://) and any S3 URL (s3:// or s3a://).
+It lists files first, posts a yes/no proposal, then streams files from WebHDFS directly to S3.
+AWS credentials profile is auto-selected from the bucket name (configured in AWS_S3_PROFILE_MAP).
 
 ━━━ RE-RUNNING / BACKFILLING DAG RUNS ━━━
 
@@ -4966,6 +5148,71 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
         )
         return
 
+    # ── Check for pending HDFS → S3 repair copy ──
+    repair = pending_hdfs_s3_copy.pop(key, None)
+    if repair:
+        reply_ts   = repair.get("thread_ts", thread_ts)
+        namenode   = repair["namenode"]
+        hdfs_path  = repair["hdfs_path"]
+        files      = repair["files"]
+        s3_bucket  = repair["s3_bucket"]
+        s3_prefix  = repair["s3_prefix"]
+        aws_profile = repair["aws_profile"]
+
+        client.chat_postMessage(
+            channel=channel, thread_ts=reply_ts,
+            text=f"🤖 *SSD Bot* — ⏳ Starting HDFS → S3 copy of *{len(files)}* files using profile `{aws_profile}`...",
+        )
+
+        success_count = 0
+        fail_count    = 0
+        errors        = []
+
+        try:
+            import boto3
+            session   = boto3.Session(profile_name=aws_profile)
+            s3_client = session.client("s3")
+        except Exception as e:
+            client.chat_postMessage(channel=channel, thread_ts=reply_ts,
+                text=f"🤖 *SSD Bot* — ❌ Failed to init S3 client with profile `{aws_profile}`: `{e}`")
+            return
+
+        for hdfs_file_path in files:
+            rel_path = hdfs_file_path[len(hdfs_path):].lstrip("/")
+            s3_key   = f"{s3_prefix}/{rel_path}" if s3_prefix else rel_path
+            webhdfs_url = f"{namenode}/webhdfs/v1{hdfs_file_path}?op=OPEN"
+            try:
+                resp = requests.get(webhdfs_url, stream=True, verify=False, timeout=120)
+                resp.raise_for_status()
+                s3_client.upload_fileobj(resp.raw, s3_bucket, s3_key)
+                success_count += 1
+                logger.info(f"HDFS→S3 copied {hdfs_file_path} → s3://{s3_bucket}/{s3_key}")
+            except Exception as e:
+                fail_count += 1
+                fname = hdfs_file_path.split("/")[-1]
+                errors.append(f"{fname}: {e}")
+                logger.error(f"HDFS→S3 copy failed {hdfs_file_path}: {e}")
+
+        if fail_count == 0:
+            client.chat_postMessage(
+                channel=channel, thread_ts=reply_ts,
+                text=(
+                    f"🤖 *SSD Bot* — ✅ HDFS → S3 copy complete!\n"
+                    f"Copied *{success_count}* file(s) to `s3://{s3_bucket}/{s3_prefix}/`"
+                ),
+            )
+        else:
+            err_str = "\n".join(errors[:5])
+            client.chat_postMessage(
+                channel=channel, thread_ts=reply_ts,
+                text=(
+                    f"🤖 *SSD Bot* — ⚠️ Copy finished with errors.\n"
+                    f"✅ {success_count} succeeded  ❌ {fail_count} failed\n"
+                    f"```{err_str}```"
+                ),
+            )
+        return
+
     # ── Check for pending backfill ──
     backfill = pending_backfill.pop(key, None)
     if backfill:
@@ -5089,6 +5336,7 @@ def handle_cancel(client, channel: str, thread_ts: str, user: str):
     pending_trigger_upstream.pop((channel, user), None)
     pending_backfill.pop((channel, user), None)
     pending_interleaved_rerun.pop((channel, user), None)
+    pending_hdfs_s3_copy.pop((channel, user), None)
 
     # Stop any running interleaved rerun background thread
     active = active_interleaved_reruns.get((channel, user))
