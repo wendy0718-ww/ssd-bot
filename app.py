@@ -2419,7 +2419,46 @@ def _aws_profile_for_bucket(bucket: str) -> str:
     return "default"
 
 
+def _expand_brace_expression(s: str) -> list:
+    """Expand a single {a,b,c} brace group in a string (recursive for multiple groups).
+
+    Examples:
+      'file_{26,27,28}.csv.gz' → ['file_26.csv.gz', 'file_27.csv.gz', 'file_28.csv.gz']
+      'DailyLog_{A,B}_{1,2}.csv' → ['DailyLog_A_1.csv', 'DailyLog_A_2.csv', ...]
+    Returns [s] unchanged if no brace group is found.
+    """
+    m = re.search(r'\{([^{}]+)\}', s)
+    if not m:
+        return [s]
+    prefix, suffix = s[:m.start()], s[m.end():]
+    result = []
+    for alt in m.group(1).split(','):
+        result.extend(_expand_brace_expression(prefix + alt.strip() + suffix))
+    return result
+
+
+def _preprocess_hdfs_url(url: str) -> tuple:
+    """If the URL contains a brace expression in the last path segment, strip it out
+    and return (base_dir_url, expanded_filenames).  Otherwise return (url, []).
+
+    Example:
+      '.../DailySSD_SunNXT_legacy/DailySessionLog_{26,27,28}.csv.gz'
+      → ('.../DailySSD_SunNXT_legacy', ['DailySessionLog_26.csv.gz', ...])
+    """
+    url = url.strip()
+    if '{' not in url:
+        return url, []
+    brace_pos = url.index('{')
+    last_slash = url.rfind('/', 0, brace_pos)
+    if last_slash == -1:
+        return url, []
+    base_url       = url[:last_slash]
+    filename_pattern = url[last_slash + 1:]
+    return base_url, _expand_brace_expression(filename_pattern)
+
+
 def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
+                                    file_filter: list = None,
                                     channel: str = "", thread_ts: str = "",
                                     user: str = "", client=None) -> str:
     """Propose copying files from an HDFS path to an S3 path (repair/manual delivery).
@@ -2428,12 +2467,32 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
     no hadoop client or disk space needed on the bot server.
 
     Args:
-        hdfs_url: HDFS source — any of:
-                  http://namenode:50070/webhdfs/v1/path
-                  http://namenode:50070/explorer.html#/path
-                  hdfs://namenode:8020/path
-        s3_url:   S3 destination — s3://bucket/prefix
+        hdfs_url:    HDFS source — any of:
+                     http://namenode:50070/webhdfs/v1/path
+                     http://namenode:50070/explorer.html#/path
+                     hdfs://namenode:8020/path
+                     Brace expressions in the last segment are expanded automatically:
+                     .../DailySSD_SunNXT_legacy/DailySessionLog_{26,27,28}.csv.gz
+        s3_url:      S3 destination — s3://bucket/prefix
+        file_filter: Optional list of exact filenames or fnmatch patterns to copy.
+                     If provided, only matching files are copied.
+                     Example: ['DailySessionLog_SunNXT_2026-08-27.csv.gz',
+                               'DailySessionLog_SunNXT_2026-08-28.csv.gz']
     """
+    import fnmatch as _fnmatch
+
+    # ── Brace expansion in the URL itself ──
+    hdfs_url, brace_filter = _preprocess_hdfs_url(hdfs_url)
+
+    # Merge brace-expanded names with explicit file_filter
+    combined_filter = []
+    if brace_filter:
+        combined_filter.extend(brace_filter)
+    if file_filter:
+        if isinstance(file_filter, str):
+            file_filter = [file_filter]
+        combined_filter.extend(file_filter)
+
     try:
         namenode, hdfs_path = _parse_hdfs_url_to_webhdfs(hdfs_url)
     except ValueError as e:
@@ -2453,6 +2512,17 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
     if not files:
         return f"No files found at `{namenode}{hdfs_path}`."
 
+    # ── Apply file filter ──
+    if combined_filter:
+        def _matches(path):
+            name = path.split('/')[-1]
+            return any(_fnmatch.fnmatch(name, pat) or name == pat
+                       for pat in combined_filter)
+        files = [f for f in files if _matches(f)]
+        if not files:
+            return (f"No files matched the filter {combined_filter} "
+                    f"at `{namenode}{hdfs_path}`.")
+
     pending_hdfs_s3_copy[(channel, user)] = {
         "namenode":   namenode,
         "hdfs_path":  hdfs_path,
@@ -2463,6 +2533,7 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
         "thread_ts":  thread_ts,
     }
 
+    filter_note = (f"\n  _Filter: {combined_filter}_" if combined_filter else "")
     sample = files[:8]
     sample_lines = "\n".join(f"  • `{f.split('/')[-1]}`" for f in sample)
     if len(files) > 8:
@@ -2476,7 +2547,7 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
                 f"*Source (HDFS):* `{namenode}{hdfs_path}/`\n"
                 f"*Destination (S3):* `s3://{s3_bucket}/{s3_prefix}/`\n"
                 f"*AWS profile:* `{aws_profile}`\n"
-                f"*Files found:* {len(files)}\n\n"
+                f"*Files found:* {len(files)}{filter_note}\n\n"
                 f"{sample_lines}\n\n"
                 f"Reply *yes* to start the copy, or *no* to cancel."
             ),
@@ -3973,12 +4044,25 @@ AGENT_TOOLS = [
                         "HDFS source URL in any format: "
                         "http://namenode:50070/webhdfs/v1/path, "
                         "http://namenode:50070/explorer.html#/path, or "
-                        "hdfs://namenode:8020/path"
+                        "hdfs://namenode:8020/path. "
+                        "Brace expressions in the last path segment are auto-expanded: "
+                        ".../DailySSD_SunNXT_legacy/DailySessionLog_{26,27,28}.csv.gz"
                     ),
                 },
                 "s3_url": {
                     "type": "string",
                     "description": "S3 destination URL, e.g. s3://bucket/prefix or s3a://bucket/prefix",
+                },
+                "file_filter": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional list of exact filenames or fnmatch patterns to copy. "
+                        "When the user names specific files, extract them here and only those files will be copied. "
+                        "Examples: ['DailySessionLog_SunNXT_2026-08-27.csv.gz', 'DailySessionLog_SunNXT_2026-08-28.csv.gz'] "
+                        "or ['DailySessionLog_SunNXT_2026-08-2?.csv.gz']. "
+                        "Leave empty to copy all files."
+                    ),
                 },
             },
             "required": ["hdfs_url", "s3_url"],
@@ -4192,6 +4276,7 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
         return tool_propose_hdfs_to_s3_repair(
             hdfs_url=inputs["hdfs_url"],
             s3_url=inputs["s3_url"],
+            file_filter=inputs.get("file_filter"),
             channel=ctx.get("channel", ""),
             thread_ts=ctx.get("thread_ts", ""),
             user=ctx.get("user", ""),
@@ -4789,6 +4874,21 @@ Use propose_hdfs_to_s3_repair when the user explicitly says things like:
   "copy files from [hdfs url] to [s3 url]"
   "manually deliver hdfs data to s3://..."
   "repair delivery, copy hdfs to s3"
+
+File filtering rules — always extract specific files when the user mentions them:
+  • User names specific files → pass them as file_filter list
+    Example: "copy DailySessionLog_SunNXT_2026-08-27.csv.gz from hdfs://... to s3://..."
+    → file_filter=["DailySessionLog_SunNXT_2026-08-27.csv.gz"]
+  • User names multiple files → list all in file_filter
+    Example: "copy the 27th, 28th, and 29th files"
+    → file_filter=["DailySessionLog_SunNXT_2026-08-27.csv.gz",
+                   "DailySessionLog_SunNXT_2026-08-28.csv.gz",
+                   "DailySessionLog_SunNXT_2026-08-29.csv.gz"]
+  • User uses brace expression in the URL → pass the URL as-is, tool expands automatically
+    Example: hdfs://.../DailySSD_SunNXT_legacy/DailySessionLog_{26,27,28}.csv.gz
+    → hdfs_url includes the brace expression, no file_filter needed
+  • No specific files mentioned → omit file_filter, all files are copied
+
 The tool lists files, shows a preview, and waits for yes/no confirmation."""
 
 
