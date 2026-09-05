@@ -5085,17 +5085,36 @@ Workflow — ALWAYS follow this exact order:
   only the DAG they mentioned.
 
   STEP 5 — Force trigger (user override).
-  If user explicitly says "trigger anyway" or "force trigger":
-  a. Extract failed_minute and flow_feed_dag_id from the conversation/thread history
-     (they are in the original Airflow alert — DO NOT ask the user for them).
-  b. If STEP 0a was not already done, call get_flow_feed_failures_at_minute(stuck_minute=<failed_minute>)
-     now, so you have ALL affected pipelines for the batch rerun.
-  c. Read Confluence page 4192337966 if not already done (for HDFS paths and upstream_airflow_base_url).
+
+  ── CASE A: user says just "force trigger" (no timestamp) ──
+  Context: They are responding to a STEP 3 "data not ready" message in this thread.
+  a. Find the MOST RECENT bot triage message in the thread — it will contain the
+     flow_feed_dag_id and the failed_minute (the flow feed's execution date).
+     DO NOT ask the user for these — they are already in the conversation.
+     If the thread has multiple triage messages, use the one immediately before
+     the user's "force trigger" message.
+  b. If STEP 0a was not already done, call get_flow_feed_failures_at_minute(stuck_minute=<failed_minute>).
+  c. Read Confluence page 4192337966 if not already done (HDFS paths + upstream_airflow_base_url).
   d. Call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path,
        event_summary_hdfs_path, upstream_airflow_base_url, force=True).
+     Note: failed_minute here is the FLOW FEED minute; the tool internally subtracts 2 min for upstream_dt.
   e. Then call propose_flow_feed_reruns_batch(dag_ids=<all DAGs from step b>,
        start_date=failed_minute, end_date=failed_minute).
-     The batch rerun is automatically queued — it posts after the trigger is confirmed.
+     Queued — appears after the trigger is confirmed.
+
+  ── CASE B: user says "force trigger upstream DAG for T" (explicit upstream time) ──
+  Examples: "force trigger upstream DAG for 2026-09-04 18:46:00"
+            "force trigger ECO_CROSS_PAGE... on 2026-09-04 18:46:00"
+  Here T is the UPSTREAM DAG's logical date — NOT the flow feed minute.
+  The flow feed minute = T + 2 min.
+  a. Parse T as the upstream logical date.
+     Compute: failed_minute = T + 2 min  (this is what to pass to propose_trigger_upstream_minute_dag).
+     The tool will display upstream_dt = failed_minute − 2 = T ✓ and flow feed minute = failed_minute ✓.
+  b. Call get_flow_feed_failures_at_minute(stuck_minute=<failed_minute>) for piccolo scan.
+  c. Read Confluence page 4192337966 for HDFS paths and upstream_airflow_base_url.
+  d. Call propose_trigger_upstream_minute_dag(failed_minute=T+2min, ..., force=True).
+  e. Call propose_flow_feed_reruns_batch(dag_ids=<all DAGs from step b>,
+       start_date=failed_minute, end_date=failed_minute). Queued after confirm.
 
 IMPORTANT: Never hardcode HDFS paths or Airflow URLs. Always read them from Confluence page 4192337966 first.
 
@@ -5120,7 +5139,9 @@ requesting a rerun, so skip the sensor log check and upstream DAG check.
 Triggers: task name contains "sensor_eco_cross_page_event_summary_ssd_minute", DAG name contains "_ECO_SSD_"
 or "_DPI_SSD_" or "Cross_Page_SSD", "DPI flow feed for HH:MM is stuck/failing", "trigger upstream for minute X",
 "fix DPI flow feed at minute X", "upstream data missing for minute X", "flow feed pipeline stuck at sensor",
-"rerun failed flow feed for", "rerun flow feed failures", "batch rerun flow feed".
+"rerun failed flow feed for", "rerun flow feed failures", "batch rerun flow feed",
+"force trigger upstream DAG for T" (CASE B — T is the upstream time, flow feed = T+2),
+"force trigger ECO_CROSS_PAGE on T" (CASE B — same).
 
 ━━━ MARKING DAG RUNS (bulk state change) ━━━
 - To bulk-mark runs in a time window: use propose_mark_dag_runs.
@@ -6305,8 +6326,13 @@ def _dispatch(text: str, user: str, client, channel: str, ts: str, thread_ts: st
     # ── Force-trigger context tracking ────────────────────────────────────────
     # If this message IS "force trigger", record the intent so that the very next
     # follow-up from the same user (if the bot asks for more info) inherits it.
+    # Exception: CASE B — user gave an explicit timestamp ("force trigger upstream DAG
+    # for 2026-09-04 18:46:00") — all info is in this message already, no follow-up
+    # needed, so don't set the carry-over flag.
     if "force trigger" in low or "trigger anyway" in low:
-        pending_force_context[key] = True
+        has_explicit_ts = bool(re.search(r'\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}', low))
+        if not has_explicit_ts:
+            pending_force_context[key] = True
 
     # If a prior "force trigger" is waiting for follow-up info, inject the flag
     # into the question before passing to the agentic loop.
