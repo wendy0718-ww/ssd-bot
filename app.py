@@ -1380,42 +1380,62 @@ def tool_propose_flow_feed_reruns_batch(
         instances_map[dag_id] = runs_found
         run_states[dag_id]    = states_seen
 
-    # Filter out DAGs where every run is already in success state
-    skipped_success = []
-    eligible_dag_ids = []
+    # Classify each DAG by current Airflow run state.
+    # Piccolo is the source of truth for who failed — if it's in the list, it failed.
+    # We exclude only those already fixed (success) or actively being fixed (running/queued).
+    # "no run found" = Airflow run missing (possibly on a different instance or execution_date
+    # mismatch) — include it since piccolo confirmed the failure.
+    eligible_dag_ids = []   # failed or no-run-found → propose rerun
+    skipped_success  = []   # all runs success → already done
+    skipped_running  = []   # running/queued → already being fixed
+
     for dag_id in dag_ids:
         states = run_states.get(dag_id, set())
-        if states and all(s == "success" for s in states):
+        if not states:
+            # No run found in Airflow; piccolo said it failed → still propose
+            eligible_dag_ids.append(dag_id)
+        elif any(s == "success" for s in states) and not any(s == "failed" for s in states):
             skipped_success.append(dag_id)
+        elif any(s in {"running", "queued", "up_for_retry"} for s in states) and not any(s == "failed" for s in states):
+            skipped_running.append((dag_id, ", ".join(sorted(states))))
         else:
+            # Has at least one failed run (or unknown state) → propose
             eligible_dag_ids.append(dag_id)
 
-    # If everything is already successful, report and stop
+    # If nothing left to propose, report and stop
     if not eligible_dag_ids:
-        msg = (
-            f"✅ *All flow feed pipelines for `{start_date}` are already in **success** state.*\n"
-            f"No rerun needed:\n" +
-            "\n".join(f"  • `{d}`" for d in skipped_success)
-        )
+        lines = ["ℹ️ *No failed flow feed pipelines to rerun:*\n"]
+        if skipped_success:
+            lines.append("✅ *Already succeeded:*\n" +
+                         "\n".join(f"  • `{d}`" for d in skipped_success))
+        if skipped_running:
+            lines.append("⏳ *Currently running/queued (wait for completion):*\n" +
+                         "\n".join(f"  • `{d}` ({s})" for d, s in skipped_running))
+        msg = "\n".join(lines)
         if client:
             client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
         return msg
 
-    # Optional note about pipelines that were skipped
-    skipped_note = ""
+    # Note about what was skipped (shown at top of proposal message)
+    skip_parts = []
     if skipped_success:
-        skipped_note = (
-            f"_(Skipping {len(skipped_success)} pipeline(s) already **success**: "
+        skip_parts.append(
+            f"{len(skipped_success)} already ✅ success: "
             + ", ".join(f"`{d}`" for d in skipped_success)
-            + ")_\n\n"
         )
+    if skipped_running:
+        skip_parts.append(
+            f"{len(skipped_running)} ⏳ running/queued: "
+            + ", ".join(f"`{d}`" for d, _ in skipped_running)
+        )
+    skipped_note = ("_(Skipping — " + "; ".join(skip_parts) + ")_\n\n") if skip_parts else ""
 
-    # Build Block Kit checkbox options (all pre-selected, shows current state)
+    # Build Block Kit checkbox options (all pre-selected)
     options = []
     for dag_id in eligible_dag_ids:
         count  = run_counts.get(dag_id, 0)
         states = run_states.get(dag_id, set())
-        state_str = ", ".join(sorted(states)) if states else "no run found"
+        state_str = ", ".join(sorted(states)) if states else "no run in Airflow"
         label = f"`{dag_id}` — {count} run(s) ({state_str})"
         options.append({
             "text":  {"type": "mrkdwn", "text": label},
@@ -2896,9 +2916,12 @@ def tool_get_flow_feed_failures_at_minute(stuck_minute: str) -> str:
     except Exception as e:
         return f"Could not parse stuck_minute '{stuck_minute}': {e}"
 
-    # Search a ±2 hour window around the stuck minute (alerts may arrive late)
-    search_start = (stuck_dt - timedelta(hours=2)).timestamp()
-    search_end   = (stuck_dt + timedelta(hours=2)).timestamp()
+    # Search from 8 hours ago up to now — wide enough to catch alerts even if the
+    # user investigates hours after the failure, while still matching only alerts
+    # at the exact stuck_minute (checked below via exec_dt == stuck_dt).
+    now = datetime.now(timezone.utc)
+    search_start = (now - timedelta(hours=8)).timestamp()
+    search_end   = now.timestamp()
 
     found_dags: dict[str, str] = {}  # dag_id → execution_date
     cursor = None
