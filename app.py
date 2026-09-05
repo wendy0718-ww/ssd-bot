@@ -158,6 +158,11 @@ pending_hdfs_s3_copy: dict = {}
 #         "start_dt": str, "end_dt": str, "thread_ts": str, "message_ts": str}
 pending_flow_feed_batch: dict = {}
 
+# Tracks when a user said "force trigger" but the bot needed to ask a follow-up question.
+# Keyed by (channel, user) → True.  Cleared as soon as the follow-up message is processed
+# so the force=True flag is injected into handle_answer's question string.
+pending_force_context: dict = {}
+
 # AWS profile map: S3 bucket prefix → credentials profile in ~/.aws/credentials
 AWS_S3_PROFILE_MAP = {
     "conviva-daas-dev": "daas-dev",
@@ -4993,7 +4998,7 @@ Workflow — ALWAYS follow this exact order:
       ★ Either path NOT ready:
         Tell user: "Upstream TLB output data is not yet ready for `[upstream_dt]`. Contact the TLB team."
         Offer: "If you'd like to trigger anyway without waiting, reply *force trigger*."
-        If user says "force trigger" → call propose_trigger_upstream_minute_dag(..., force=True).
+        If user says "force trigger" → follow STEP 5 (extract context, scan piccolo, propose force trigger + batch rerun).
 
   STEP 4 — Propose actions.
   For BRANCH aa (never triggered) with data ready:
@@ -5014,14 +5019,39 @@ Workflow — ALWAYS follow this exact order:
   only the DAG they mentioned.
 
   STEP 5 — Force trigger (user override).
-  If user explicitly says "trigger anyway" or "force trigger" →
-  call propose_trigger_upstream_minute_dag(..., force=True) immediately, regardless of HDFS state.
+  If user explicitly says "trigger anyway" or "force trigger":
+  a. Extract failed_minute and flow_feed_dag_id from the conversation/thread history
+     (they are in the original Airflow alert — DO NOT ask the user for them).
+  b. If STEP 0a was not already done, call get_flow_feed_failures_at_minute(stuck_minute=<failed_minute>)
+     now, so you have ALL affected pipelines for the batch rerun.
+  c. Read Confluence page 4192337966 if not already done (for HDFS paths and upstream_airflow_base_url).
+  d. Call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path,
+       event_summary_hdfs_path, upstream_airflow_base_url, force=True).
+  e. Then call propose_flow_feed_reruns_batch(dag_ids=<all DAGs from step b>,
+       start_date=failed_minute, end_date=failed_minute).
+     The batch rerun is automatically queued — it posts after the trigger is confirmed.
 
 IMPORTANT: Never hardcode HDFS paths or Airflow URLs. Always read them from Confluence page 4192337966 first.
 
+━━━ MANUAL FLOW FEED BATCH RERUN ━━━
+Command: "rerun failed flow feed for YYYY-MM-DD HH:MM:SS"
+         (also: "rerun flow feed failures at HH:MM", "batch rerun flow feed for <timestamp>", etc.)
+
+When the user gives a timestamp without a Slack alert, do:
+  1. Parse the timestamp as UTC — e.g. "2026-09-05 18:48:00" → stuck_minute = "2026-09-05T18:48:00+00:00"
+  2. Call get_flow_feed_failures_at_minute(stuck_minute=<stuck_minute>).
+  3. If failures found: call propose_flow_feed_reruns_batch(dag_ids=<found_dags>,
+       start_date=<stuck_minute>, end_date=<stuck_minute>).
+  4. If no failures found: tell the user no flow feed sensor failures were found in
+     #piccolo-daas-alert for that minute, and ask if they'd like to rerun a specific DAG manually.
+
+Do NOT run the full diagnostic workflow (STEP 0–4) for this command — the user is explicitly
+requesting a rerun, so skip the sensor log check and upstream DAG check.
+
 Triggers: task name contains "sensor_eco_cross_page_event_summary_ssd_minute", DAG name contains "_ECO_SSD_"
 or "_DPI_SSD_" or "Cross_Page_SSD", "DPI flow feed for HH:MM is stuck/failing", "trigger upstream for minute X",
-"fix DPI flow feed at minute X", "upstream data missing for minute X", "flow feed pipeline stuck at sensor".
+"fix DPI flow feed at minute X", "upstream data missing for minute X", "flow feed pipeline stuck at sensor",
+"rerun failed flow feed for", "rerun flow feed failures", "batch rerun flow feed".
 
 ━━━ MARKING DAG RUNS (bulk state change) ━━━
 - To bulk-mark runs in a time window: use propose_mark_dag_runs.
@@ -6040,6 +6070,7 @@ def handle_cancel(client, channel: str, thread_ts: str, user: str):
     pending_backfill.pop((channel, user), None)
     pending_interleaved_rerun.pop((channel, user), None)
     pending_hdfs_s3_copy.pop((channel, user), None)
+    pending_force_context.pop((channel, user), None)
 
     # Stop any running interleaved rerun background thread
     active = active_interleaved_reruns.get((channel, user))
@@ -6179,7 +6210,8 @@ def handle_message_events(body, event, client, logger):
         (channel, user) in pending_trigger_upstream or
         (channel, user) in pending_backfill or
         (channel, user) in pending_interleaved_rerun or
-        (channel, user) in active_interleaved_reruns   # allow "cancel rerun" mid-run
+        (channel, user) in active_interleaved_reruns or  # allow "cancel rerun" mid-run
+        (channel, user) in pending_force_context         # awaiting follow-up after "force trigger"
     )
     in_active_thread = thread_ts and thread_ts in active_threads
 
@@ -6198,6 +6230,24 @@ def handle_message_events(body, event, client, logger):
 def _dispatch(text: str, user: str, client, channel: str, ts: str, thread_ts: str):
     """Route a message to the right handler and mark the thread as active."""
     intent = classify_intent(text)
+    key = (channel, user)
+    low = text.lower().strip()
+
+    # ── Force-trigger context tracking ────────────────────────────────────────
+    # If this message IS "force trigger", record the intent so that the very next
+    # follow-up from the same user (if the bot asks for more info) inherits it.
+    if "force trigger" in low or "trigger anyway" in low:
+        pending_force_context[key] = True
+
+    # If a prior "force trigger" is waiting for follow-up info, inject the flag
+    # into the question before passing to the agentic loop.
+    elif key in pending_force_context and intent not in ("confirm", "cancel", "remember", "update", "sync"):
+        text = (
+            "[Context: the user previously said 'force trigger'. "
+            "Apply force=True when calling propose_trigger_upstream_minute_dag — "
+            "skip the HDFS _SUCCESS check entirely.]\n" + text
+        )
+        pending_force_context.pop(key, None)
 
     if intent == "confirm":
         handle_confirm(client, channel, thread_ts, user)
