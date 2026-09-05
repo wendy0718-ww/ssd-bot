@@ -1363,23 +1363,60 @@ def tool_propose_flow_feed_reruns_batch(
     if not dag_ids:
         return "No DAG IDs provided."
 
-    # Discover runs per DAG across all Airflow instances
+    # Discover runs per DAG across all Airflow instances; capture states
     instances_map = {}  # dag_id → [(label, base)]
     run_counts    = {}  # dag_id → int
+    run_states    = {}  # dag_id → set of state strings
     for dag_id in dag_ids:
-        runs_found = []
+        runs_found   = []
+        states_seen  = set()
         for label, base in AIRFLOW_INSTANCES.items():
             runs = _airflow_get_dag_runs_in_range(base, dag_id, start_date, end_date)
             if runs:
                 runs_found.append((label, base))
                 run_counts[dag_id] = run_counts.get(dag_id, 0) + len(runs)
+                for r in runs:
+                    states_seen.add(r.get("state", "unknown"))
         instances_map[dag_id] = runs_found
+        run_states[dag_id]    = states_seen
 
-    # Build Block Kit checkbox options (all pre-selected)
-    options = []
+    # Filter out DAGs where every run is already in success state
+    skipped_success = []
+    eligible_dag_ids = []
     for dag_id in dag_ids:
-        count = run_counts.get(dag_id, 0)
-        label = f"`{dag_id}` — {count} run(s)"
+        states = run_states.get(dag_id, set())
+        if states and all(s == "success" for s in states):
+            skipped_success.append(dag_id)
+        else:
+            eligible_dag_ids.append(dag_id)
+
+    # If everything is already successful, report and stop
+    if not eligible_dag_ids:
+        msg = (
+            f"✅ *All flow feed pipelines for `{start_date}` are already in **success** state.*\n"
+            f"No rerun needed:\n" +
+            "\n".join(f"  • `{d}`" for d in skipped_success)
+        )
+        if client:
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=msg)
+        return msg
+
+    # Optional note about pipelines that were skipped
+    skipped_note = ""
+    if skipped_success:
+        skipped_note = (
+            f"_(Skipping {len(skipped_success)} pipeline(s) already **success**: "
+            + ", ".join(f"`{d}`" for d in skipped_success)
+            + ")_\n\n"
+        )
+
+    # Build Block Kit checkbox options (all pre-selected, shows current state)
+    options = []
+    for dag_id in eligible_dag_ids:
+        count  = run_counts.get(dag_id, 0)
+        states = run_states.get(dag_id, set())
+        state_str = ", ".join(sorted(states)) if states else "no run found"
+        label = f"`{dag_id}` — {count} run(s) ({state_str})"
         options.append({
             "text":  {"type": "mrkdwn", "text": label},
             "value": dag_id,
@@ -1393,6 +1430,7 @@ def tool_propose_flow_feed_reruns_batch(
                 "text": (
                     f"♻️ *Proposed: Rerun Flow Feed Pipelines*\n"
                     f"*Minute:* `{start_date}` → `{end_date}`\n\n"
+                    f"{skipped_note}"
                     f"Select pipelines to rerun (all pre-selected):"
                 ),
             },
@@ -1431,7 +1469,7 @@ def tool_propose_flow_feed_reruns_batch(
 
     key = (channel, user)
     pending_flow_feed_batch[key] = {
-        "dag_ids":       dag_ids,
+        "dag_ids":       eligible_dag_ids,
         "instances_map": instances_map,
         "start_dt":      start_date,
         "end_dt":        end_date,
@@ -1445,7 +1483,7 @@ def tool_propose_flow_feed_reruns_batch(
                 channel=channel,
                 thread_ts=thread_ts,
                 text=(
-                    f"♻️ Proposed rerun for {len(dag_ids)} flow-feed pipeline(s) "
+                    f"♻️ Proposed rerun for {len(eligible_dag_ids)} flow-feed pipeline(s) "
                     f"at minute `{start_date}`. Click ✅ to confirm or ❌ to cancel."
                 ),
                 blocks=blocks,
@@ -1456,13 +1494,18 @@ def tool_propose_flow_feed_reruns_batch(
             client.chat_postMessage(
                 channel=channel, thread_ts=thread_ts,
                 text=(
-                    f"♻️ *Proposed: Rerun {len(dag_ids)} Flow Feed Pipeline(s)*\n"
-                    + "\n".join(f"  • `{d}` ({run_counts.get(d, 0)} run(s))" for d in dag_ids)
+                    (f"{skipped_note}" if skipped_note else "") +
+                    f"♻️ *Proposed: Rerun {len(eligible_dag_ids)} Flow Feed Pipeline(s)*\n"
+                    + "\n".join(
+                        f"  • `{d}` ({run_counts.get(d, 0)} run(s), "
+                        f"{', '.join(sorted(run_states.get(d, {'unknown'})))})"
+                        for d in eligible_dag_ids
+                    )
                     + f"\n\nRange: `{start_date}` → `{end_date}`\n\nReply *yes* to rerun all, or *no* to cancel."
                 ),
             )
 
-    return f"Batch rerun proposal posted for {len(dag_ids)} DAG(s). Waiting for user selection."
+    return f"Batch rerun proposal posted for {len(eligible_dag_ids)} DAG(s). Waiting for user selection."
 
 
 def _execute_flow_feed_batch_rerun(client, channel: str, thread_ts: str, user: str,
@@ -5042,8 +5085,11 @@ When the user gives a timestamp without a Slack alert, do:
   2. Call get_flow_feed_failures_at_minute(stuck_minute=<stuck_minute>).
   3. If failures found: call propose_flow_feed_reruns_batch(dag_ids=<found_dags>,
        start_date=<stuck_minute>, end_date=<stuck_minute>).
-  4. If no failures found: tell the user no flow feed sensor failures were found in
-     #piccolo-daas-alert for that minute, and ask if they'd like to rerun a specific DAG manually.
+     The function automatically checks each DAG's current run status and skips any that are
+     already in success state — only failed/non-success pipelines appear in the checkbox UI.
+     If ALL are already success, it reports that and stops.
+  4. If no failures found in #piccolo-daas-alert: tell the user and ask if they'd like to
+     rerun a specific DAG manually.
 
 Do NOT run the full diagnostic workflow (STEP 0–4) for this command — the user is explicitly
 requesting a rerun, so skip the sensor log check and upstream DAG check.
