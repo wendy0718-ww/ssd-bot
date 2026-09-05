@@ -142,11 +142,21 @@ pending_mark_runs: dict = {}
 # Pending bulk DAG run clears (re-run/backfill) awaiting human confirmation
 pending_rerun_runs: dict = {}
 
+# Queue of rerun proposals that are waiting behind a pending upstream trigger or
+# another active rerun proposal. Keyed by (channel, user) → list[rerun_dict].
+# Each entry is popped and posted to Slack only after the current action is confirmed.
+pending_rerun_queue: dict = {}
+
 # Pending upstream minute DAG trigger awaiting human confirmation
 pending_trigger_upstream: dict = {}
 
 # Pending HDFS → S3 repair copy awaiting human confirmation
 pending_hdfs_s3_copy: dict = {}
+
+# Pending batch flow-feed rerun with checkbox selection awaiting confirmation
+# Value: {"dag_ids": [...], "instances_map": {dag_id: [(label, base)]},
+#         "start_dt": str, "end_dt": str, "thread_ts": str, "message_ts": str}
+pending_flow_feed_batch: dict = {}
 
 # AWS profile map: S3 bucket prefix → credentials profile in ~/.aws/credentials
 AWS_S3_PROFILE_MAP = {
@@ -366,16 +376,26 @@ def _pd_alert_to_question(parsed: dict) -> str:
             f"- Failing sensor task: `{task_id}`\n"
             f"- Stuck minute: `{exec_date}`\n"
             f"- Task state: `{state}`\n\n"
-            f"This is a DPI Flow Feed stuck-at-sensor issue. Run the fix workflow:\n"
-            f"1. Call get_flow_feed_failures_at_minute(stuck_minute=`{exec_date}`) to find ALL "
-            f"pipelines stuck at this minute from #piccolo-daas-alert — not just this one.\n"
-            f"2. Read Confluence page 4192337966 for HDFS paths and upstream Airflow URL.\n"
-            f"3. Check HDFS success flag for upstream minute (stuck minute − 2 min).\n"
-            f"4. Propose triggering ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG.\n"
-            f"5. After the upstream trigger proposal, propose rerunning ALL stuck flow feed DAGs "
-            f"found in step 1 for minute `{exec_date}` — one propose_rerun_dag_runs call per DAG "
-            f"(start_date=`{exec_date}`, end_date=`{exec_date}`). If step 1 found no others, "
-            f"just rerun `{dag_id}`."
+            f"This is a DPI Flow Feed stuck-at-sensor issue. Follow the workflow exactly:\n"
+            f"1. Call get_flow_feed_failures_at_minute(stuck_minute=`{exec_date}`) — find ALL "
+            f"pipelines stuck at this minute from #piccolo-daas-alert.\n"
+            f"2. Call get_airflow_task_log for sensor task `{task_id}` (use highest try_number). "
+            f"Read the failure reason:\n"
+            f"   BRANCH B: If NOT a sensor-timeout/upstream-data-not-ready error → STOP. Tell user: "
+            f"'❌ Failure not covered in runbook. Failure: [error]. Fix first, then ask me: "
+            f"rerun {dag_id} for {exec_date}'. Do NOT proceed.\n"
+            f"   BRANCH A: If sensor timed out waiting for upstream → continue.\n"
+            f"3. Read Confluence page 4192337966 for HDFS paths and upstream Airflow base URL.\n"
+            f"4. Check upstream DAG status: call get_airflow_dag_runs for "
+            f"ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG at upstream_dt (={exec_date} − 2 min):\n"
+            f"   BRANCH aa (no run): check HDFS data → if ready, propose trigger + batch rerun.\n"
+            f"   BRANCH ab (run failed): get failed task log, summarise error, tell user: "
+            f"'Fix then ask me: rerun ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG for [upstream_dt]'.\n"
+            f"   BRANCH ac (running/queued): tell user to wait, no action needed.\n"
+            f"   BRANCH ad (success): check HDFS — if ready, skip trigger, just propose batch rerun.\n"
+            f"5. Use propose_flow_feed_reruns_batch(dag_ids=[all DAGs from step 1], "
+            f"start_date=`{exec_date}`, end_date=`{exec_date}`) for the rerun proposal — "
+            f"NOT propose_rerun_dag_runs. This gives the user a checkbox UI to select pipelines."
         )
 
     return (
@@ -1248,33 +1268,245 @@ def tool_propose_rerun_dag_runs(dag_id: str, start_date: str, end_date: str,
     # Group instances that actually have runs (for the actual clear call)
     instances_with_runs = list({r["label"]: r["base"] for r in found}.items())
 
-    # Store for confirmation
-    pending_rerun_runs[(channel, user)] = {
+    rerun_data = {
         "dag_id":               dag_id,
         "start_dt":             start_dt,
         "end_dt":               end_dt,
         "instances_with_runs":  instances_with_runs,
         "run_count":            len(found),
         "thread_ts":            thread_ts,
+        "state_summary":        state_summary,
+        "first_run":            first_run,
+        "last_run":             last_run,
+    }
+
+    key = (channel, user)
+
+    # If an upstream trigger OR another rerun is already awaiting confirmation,
+    # queue this rerun instead of posting it now — prevents ambiguous "yes" responses.
+    if key in pending_trigger_upstream or key in pending_rerun_runs:
+        if key not in pending_rerun_queue:
+            pending_rerun_queue[key] = []
+        pending_rerun_queue[key].append(rerun_data)
+        if client:
+            queue_len = len(pending_rerun_queue[key])
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=(
+                    f"📋 *Queued: Re-run `{dag_id}`* ({len(found)} run(s))\n"
+                    f"Will be proposed after the current action is confirmed."
+                    f" (Queue position: {queue_len})"
+                ),
+            )
+        return f"Queued rerun for {dag_id} ({len(found)} runs) — will propose after current action confirmed."
+
+    # No conflict — post proposal immediately and make it active
+    pending_rerun_runs[key] = rerun_data
+
+    if client:
+        _post_rerun_proposal(client, channel, thread_ts, rerun_data)
+    return f"✅ Preview posted. Waiting for yes/no to clear {len(found)} run(s) for re-execution."
+
+
+def _post_rerun_proposal(client, channel: str, thread_ts: str, rerun_data: dict):
+    """Post the rerun confirmation message to Slack."""
+    client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=(
+            f"♻️ *Proposed: Re-run / Backfill DAG Runs*\n\n"
+            f"*DAG:* `{rerun_data['dag_id']}`\n"
+            f"*Range:* `{rerun_data['start_dt']}` → `{rerun_data['end_dt']}`\n"
+            f"*Runs found:* {rerun_data['run_count']} ({rerun_data['state_summary']})\n"
+            f"*First run:* `{rerun_data['first_run']}` UTC\n"
+            f"*Last run:*  `{rerun_data['last_run']}` UTC\n\n"
+            f"This will *clear* all {rerun_data['run_count']} run(s) so Airflow re-executes them. "
+            f"`max_active_runs` throttling still applies — Airflow paces the backfill automatically.\n\n"
+            f"Reply *yes* to confirm, or *no* to cancel."
+        ),
+    )
+
+
+def _dequeue_next_rerun(client, channel: str, thread_ts: str, user: str):
+    """After an action is confirmed, pop the next queued rerun and post its proposal."""
+    key = (channel, user)
+    queue = pending_rerun_queue.get(key, [])
+    if not queue:
+        return
+    next_rerun = queue.pop(0)
+    if not queue:
+        pending_rerun_queue.pop(key, None)
+    pending_rerun_runs[key] = next_rerun
+    if client:
+        _post_rerun_proposal(client, channel, next_rerun.get("thread_ts", thread_ts), next_rerun)
+
+
+def tool_propose_flow_feed_reruns_batch(
+    dag_ids: list, start_date: str, end_date: str,
+    channel: str = "", thread_ts: str = "", user: str = "", client=None,
+) -> str:
+    """Propose rerunning multiple flow-feed DAGs in one Slack Block Kit message with checkboxes.
+
+    The user can check/uncheck individual DAGs before clicking "Rerun Selected".
+    All DAGs are pre-selected by default. Falls back gracefully if block_kit fails.
+
+    Args:
+        dag_ids:    List of DAG IDs to propose for rerun.
+        start_date: Execution date/time window start (same as end for a single minute).
+        end_date:   Execution date/time window end.
+    """
+    if not dag_ids:
+        return "No DAG IDs provided."
+
+    # Discover runs per DAG across all Airflow instances
+    instances_map = {}  # dag_id → [(label, base)]
+    run_counts    = {}  # dag_id → int
+    for dag_id in dag_ids:
+        runs_found = []
+        for label, base in AIRFLOW_INSTANCES.items():
+            runs = _airflow_get_dag_runs_in_range(base, dag_id, start_date, end_date)
+            if runs:
+                runs_found.append((label, base))
+                run_counts[dag_id] = run_counts.get(dag_id, 0) + len(runs)
+        instances_map[dag_id] = runs_found
+
+    # Build Block Kit checkbox options (all pre-selected)
+    options = []
+    for dag_id in dag_ids:
+        count = run_counts.get(dag_id, 0)
+        label = f"`{dag_id}` — {count} run(s)"
+        options.append({
+            "text":  {"type": "mrkdwn", "text": label},
+            "value": dag_id,
+        })
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"♻️ *Proposed: Rerun Flow Feed Pipelines*\n"
+                    f"*Minute:* `{start_date}` → `{end_date}`\n\n"
+                    f"Select pipelines to rerun (all pre-selected):"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": "flow_feed_checkboxes",
+            "elements": [{
+                "type":            "checkboxes",
+                "action_id":       "flow_feed_select",
+                "options":         options,
+                "initial_options": options,   # all checked by default
+            }],
+        },
+        {
+            "type": "actions",
+            "block_id": "flow_feed_buttons",
+            "elements": [
+                {
+                    "type":      "button",
+                    "text":      {"type": "plain_text", "text": "✅ Rerun Selected"},
+                    "style":     "primary",
+                    "action_id": "flow_feed_confirm_rerun",
+                    "value":     "confirm",
+                },
+                {
+                    "type":      "button",
+                    "text":      {"type": "plain_text", "text": "❌ Cancel"},
+                    "style":     "danger",
+                    "action_id": "flow_feed_cancel_rerun",
+                    "value":     "cancel",
+                },
+            ],
+        },
+    ]
+
+    key = (channel, user)
+    pending_flow_feed_batch[key] = {
+        "dag_ids":       dag_ids,
+        "instances_map": instances_map,
+        "start_dt":      start_date,
+        "end_dt":        end_date,
+        "thread_ts":     thread_ts,
+        "message_ts":    None,  # filled after post
     }
 
     if client:
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=(
-                f"♻️ *Proposed: Re-run / Backfill DAG Runs*\n\n"
-                f"*DAG:* `{dag_id}`\n"
-                f"*Range:* `{start_dt}` → `{end_dt}`\n"
-                f"*Runs found:* {len(found)} ({state_summary})\n"
-                f"*First run:* `{first_run}` UTC\n"
-                f"*Last run:*  `{last_run}` UTC\n\n"
-                f"This will *clear* all {len(found)} run(s) so Airflow re-executes them. "
-                f"`max_active_runs` throttling still applies — Airflow paces the backfill automatically.\n\n"
-                f"Reply *yes* to confirm, or *no* to cancel."
-            ),
-        )
-    return f"✅ Preview posted. Waiting for yes/no to clear {len(found)} run(s) for re-execution."
+        try:
+            resp = client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=(
+                    f"♻️ Proposed rerun for {len(dag_ids)} flow-feed pipeline(s) "
+                    f"at minute `{start_date}`. Click ✅ to confirm or ❌ to cancel."
+                ),
+                blocks=blocks,
+            )
+            pending_flow_feed_batch[key]["message_ts"] = resp.get("ts")
+        except Exception as e:
+            logger.warning(f"tool_propose_flow_feed_reruns_batch block_kit failed: {e} — falling back to text")
+            client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=(
+                    f"♻️ *Proposed: Rerun {len(dag_ids)} Flow Feed Pipeline(s)*\n"
+                    + "\n".join(f"  • `{d}` ({run_counts.get(d, 0)} run(s))" for d in dag_ids)
+                    + f"\n\nRange: `{start_date}` → `{end_date}`\n\nReply *yes* to rerun all, or *no* to cancel."
+                ),
+            )
+
+    return f"Batch rerun proposal posted for {len(dag_ids)} DAG(s). Waiting for user selection."
+
+
+def _execute_flow_feed_batch_rerun(client, channel: str, thread_ts: str, user: str,
+                                    selected_dag_ids: list):
+    """Execute clear/rerun for the selected flow-feed DAGs from the batch proposal."""
+    key = (channel, user)
+    batch = pending_flow_feed_batch.pop(key, None)
+    if not batch:
+        return
+
+    instances_map = batch["instances_map"]
+    start_dt      = batch["start_dt"]
+    end_dt        = batch["end_dt"]
+    reply_ts      = batch.get("thread_ts", thread_ts)
+
+    results = []
+    for dag_id in selected_dag_ids:
+        instances = instances_map.get(dag_id, [])
+        if not instances:
+            results.append(f"⚠️ `{dag_id}` — no runs found, skipped")
+            continue
+        ok_count = 0
+        for label, base in instances:
+            headers = _get_airflow_headers(base)
+            url     = f"{base}/api/v1/dags/{dag_id}/clearTaskInstances"
+            payload = {
+                "start_date":     start_dt,
+                "end_date":       end_dt,
+                "reset_dag_runs": True,
+                "dry_run":        False,
+            }
+            try:
+                resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=60)
+                if resp.ok:
+                    ok_count += len(resp.json().get("task_instances", []))
+                else:
+                    logger.warning(f"batch_rerun {dag_id} {label}: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                logger.error(f"batch_rerun {dag_id} {label} error: {e}")
+        results.append(f"✅ `{dag_id}` — cleared")
+
+    client.chat_postMessage(
+        channel=channel, thread_ts=reply_ts,
+        text=(
+            f"🤖 *SSD Bot* — ♻️ *Rerun complete!*\n"
+            + "\n".join(results)
+            + f"\n\nAirflow will re-execute selected pipelines now."
+        ),
+    )
 
 
 def _run_interleaved_rerun_worker(
@@ -1586,6 +1818,30 @@ def _airflow_trigger_dag_run(base: str, dag_id: str, dag_run_id: str,
         return {"ok": False, "error": str(e)}
 
 
+def _airflow_clear_dag_run(base: str, dag_id: str, dag_run_id: str) -> dict:
+    """Clear (re-run) an existing DAG run via clearTaskInstances API.
+
+    Used when a run already exists (409 would occur on POST /dagRuns).
+    Clears all task instances and resets the DAGRun state to queued.
+    """
+    headers = _get_airflow_headers(base)
+    url = f"{base}/api/v1/dags/{dag_id}/clearTaskInstances"
+    payload = {
+        "dag_run_id":    dag_run_id,
+        "dry_run":       False,
+        "reset_dag_runs": True,
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=30)
+        logger.info(f"clear_dag_run {dag_id} {dag_run_id} → {resp.status_code}: {resp.text[:300]}")
+        if resp.ok:
+            return {"ok": True, "data": resp.json()}
+        return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:300]}"}
+    except Exception as e:
+        logger.error(f"_airflow_clear_dag_run error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
 def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
                                               cross_page_hdfs_path: str,
                                               event_summary_hdfs_path: str,
@@ -1665,15 +1921,22 @@ def tool_propose_trigger_upstream_minute_dag(failed_minute: str,
     conf_str = json.dumps(conf, indent=2)
 
     # Store for confirmation
+    # If a failed/success run already exists, store its run_id so handle_confirm
+    # can clear it instead of POSTing a new run (which would 409).
+    existing_failed_run_id = None
+    if existing_run and existing_run.get("state") in ("failed", "success"):
+        existing_failed_run_id = existing_run.get("dag_run_id")
+
     pending_trigger_upstream[(channel, user)] = {
-        "dag_id":        UPSTREAM_MINUTE_DAG_ID,
-        "base":          base,
-        "dag_run_id":    dag_run_id,
-        "logical_date":  upstream_dt_str,
-        "conf":          conf,
-        "failed_minute": failed_minute,
-        "thread_ts":     thread_ts,
-        "force":         force,
+        "dag_id":               UPSTREAM_MINUTE_DAG_ID,
+        "base":                 base,
+        "dag_run_id":           dag_run_id,
+        "logical_date":         upstream_dt_str,
+        "conf":                 conf,
+        "failed_minute":        failed_minute,
+        "thread_ts":            thread_ts,
+        "force":                force,
+        "existing_run_id":      existing_failed_run_id,  # non-None → use clear instead of create
     }
 
     force_warning = (
@@ -2438,23 +2701,35 @@ def _expand_brace_expression(s: str) -> list:
 
 
 def _preprocess_hdfs_url(url: str) -> tuple:
-    """If the URL contains a brace expression in the last path segment, strip it out
-    and return (base_dir_url, expanded_filenames).  Otherwise return (url, []).
+    """If the URL contains a brace expression or glob pattern in the last path segment,
+    strip it out and return (base_dir_url, filter_patterns).  Otherwise return (url, []).
 
-    Example:
+    Examples:
       '.../DailySSD_SunNXT_legacy/DailySessionLog_{26,27,28}.csv.gz'
       → ('.../DailySSD_SunNXT_legacy', ['DailySessionLog_26.csv.gz', ...])
+
+      '.../DailySSD_SunNXT_legacy/DailySessionLog_SunNXT_*.csv.gz'
+      → ('.../DailySSD_SunNXT_legacy', ['DailySessionLog_SunNXT_*.csv.gz'])
     """
     url = url.strip()
-    if '{' not in url:
-        return url, []
-    brace_pos = url.index('{')
-    last_slash = url.rfind('/', 0, brace_pos)
-    if last_slash == -1:
-        return url, []
-    base_url       = url[:last_slash]
-    filename_pattern = url[last_slash + 1:]
-    return base_url, _expand_brace_expression(filename_pattern)
+
+    # ── Brace expression: {a,b,c} → expanded list ─────────────────────────────
+    if '{' in url:
+        brace_pos  = url.index('{')
+        last_slash = url.rfind('/', 0, brace_pos)
+        if last_slash != -1:
+            base_url         = url[:last_slash]
+            filename_pattern = url[last_slash + 1:]
+            return base_url, _expand_brace_expression(filename_pattern)
+
+    # ── Glob pattern: * or ? in the last segment → single fnmatch pattern ─────
+    last_slash = url.rfind('/')
+    if last_slash != -1:
+        last_segment = url[last_slash + 1:]
+        if '*' in last_segment or '?' in last_segment:
+            return url[:last_slash], [last_segment]
+
+    return url, []
 
 
 def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
@@ -3819,6 +4094,35 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "propose_flow_feed_reruns_batch",
+        "description": (
+            "Propose rerunning multiple DPI Flow Feed pipelines in a single Slack message "
+            "with checkboxes — the user can check/uncheck individual pipelines before confirming. "
+            "Use this instead of multiple propose_rerun_dag_runs calls when you have a list of "
+            "flow-feed DAGs to rerun for the same minute/window (e.g. from get_flow_feed_failures_at_minute). "
+            "All pipelines are pre-selected by default; user clicks '✅ Rerun Selected' to confirm."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dag_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of DAG IDs to include in the batch rerun proposal.",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start of the window in UTC, e.g. '2026-09-04T08:56:00+00:00'",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End of the window in UTC (same as start for a single minute).",
+                },
+            },
+            "required": ["dag_ids", "start_date", "end_date"],
+        },
+    },
+    {
         "name": "propose_confluence_update",
         "description": (
             "Propose an update to the SSD Confluence runbook. "
@@ -4248,6 +4552,16 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             user=ctx.get("user", ""),
             client=ctx.get("client"),
         )
+    if name == "propose_flow_feed_reruns_batch":
+        return tool_propose_flow_feed_reruns_batch(
+            dag_ids=inputs["dag_ids"],
+            start_date=inputs["start_date"],
+            end_date=inputs["end_date"],
+            channel=ctx.get("channel", ""),
+            thread_ts=ctx.get("thread_ts", ""),
+            user=ctx.get("user", ""),
+            client=ctx.get("client"),
+        )
     if name == "propose_new_confluence_page":
         return tool_propose_new_confluence_page(
             title=inputs["title"],
@@ -4602,39 +4916,108 @@ DETECTION — The following are ALL indicators of this issue, regardless of phra
   → immediately extract TIMESTAMP as failed_minute and proceed with the workflow below.
   Do NOT run the generic full pipeline health check (Steps A–F) for this issue.
 
-When a minute-level DPI Flow Feed pipeline is stuck/failed at its first sensor task due to missing upstream data:
-1. The fix is to trigger ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG. The Airflow instance and URL MUST be read from the Confluence playbook — do NOT hardcode any URL or instance name.
-2. The upstream logical date = failed_minute − 2 mins.
-3. HDFS paths AND the upstream Airflow URL MUST be read live from the Confluence playbook — they are NOT hardcoded in the bot.
+When a minute-level DPI Flow Feed pipeline fails at its first sensor task, the root cause is always
+one of three things: (a) ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG was never triggered,
+(b) it was triggered but failed, or (c) the sensor failed for an unrelated reason.
+The upstream logical date is always failed_minute − 2 mins.
+HDFS paths AND upstream Airflow URL MUST be read live from Confluence page 4192337966 — never hardcoded.
 
 Workflow — ALWAYS follow this exact order:
-  0. If triggered by a TaskInstance alert (sensor_eco_cross_page_event_summary_ssd_minute):
-     Call get_flow_feed_failures_at_minute(stuck_minute=<exec_date>) FIRST to discover all pipelines
-     stuck at this minute in #piccolo-daas-alert. Remember the full list for step 4a.
-  1. Call read_confluence_page with page_id="4192337966" to get the current playbook.
-  2. From the page, extract:
-       - cross_page_hdfs_path: the hdfs:// path for ecoCrossPageFlow from the config JSON example
-       - event_summary_hdfs_path: the hdfs:// path for ecoEventSummary from the config JSON example
-       - namenode_http: the HTTP host from the HDFS explorer URLs (e.g. http://rccp408-24a.iad6.prod.conviva.com:50070)
-       - upstream_airflow_base_url: the base URL of the Airflow instance from the upstream DAG link in the runbook
-         (e.g. if the runbook shows 'https://conviva-airflow.prod.conviva.com/dags/ECO_.../grid', extract 'https://conviva-airflow.prod.conviva.com')
-         Do NOT guess or hardcode this — read it from the page every time.
-  3. Call check_hdfs_minute_data(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, namenode_http).
-  4. If BOTH paths are ready → call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, upstream_airflow_base_url) IMMEDIATELY.
-     Do NOT ask "shall I propose the trigger?" — just call the tool. The tool shows a preview and waits for yes/no itself.
-     4a. After proposing the upstream trigger, also call propose_rerun_dag_runs for EACH stuck flow feed
-         DAG found in step 0 (start_date=failed_minute, end_date=failed_minute).
-         If step 0 found N DAGs, make N separate propose_rerun_dag_runs calls, one per DAG.
-         Tell the user: "Once the upstream DAG succeeds, confirm each rerun below to retry all stuck flow feed pipelines."
-         If step 0 was not run (user typed manually, not from an alert), only rerun the DAG mentioned by the user.
-  5. If either path is NOT ready → tell the user data is missing, they should contact the TLB team.
-     Also offer: "If you'd like to trigger anyway without waiting for the success flag, reply *force trigger*."
-     If the user confirms they want to force trigger → call propose_trigger_upstream_minute_dag(..., force=True).
-     The proposal will show a clear warning that data was not confirmed.
-  6. If the user explicitly says "trigger anyway" or "force trigger" despite missing data → call propose_trigger_upstream_minute_dag(..., force=True) immediately.
+
+  STEP 0 — *** MANDATORY for TaskInstance alerts — do NOT skip ***
+
+  0a. Call get_flow_feed_failures_at_minute(stuck_minute=<exec_date>) FIRST.
+      Scans #piccolo-daas-alert to find ALL pipelines stuck at this minute.
+      Save the full list — needed in the final rerun step.
+
+  0b. Call get_airflow_task_log(dag_id, dag_run_id, task_id=<sensor_task_id>, try_number=<highest>)
+      to read the actual failure reason.
+
+      ★ BRANCH B — Log shows a DIFFERENT error (infra error, Python exception, auth failure, etc.)
+        that is NOT "upstream data not ready" → STOP immediately. Reply:
+        "❌ *Failure not covered in runbook.*
+        Failure reason: `[key error line]`
+        Please investigate and fix the root cause manually.
+        Once fixed, ask me: *'rerun [dag_id] for [execution_date]'*"
+        Do NOT proceed further.
+
+      ★ BRANCH A — Log confirms sensor timed out waiting for upstream data
+        (keywords: "Sensor has timed out", "PokeReturnedFalse", "HDFS path not found",
+        "upstream not ready", repeated poke attempts giving up) → continue to STEP 1.
+
+  STEP 1 — Read Confluence playbook (page_id="4192337966").
+  Extract from the page:
+    - cross_page_hdfs_path (hdfs:// path for ecoCrossPageFlow)
+    - event_summary_hdfs_path (hdfs:// path for ecoEventSummary)
+    - namenode_http (HTTP host for HDFS explorer, e.g. http://rccp408-24a.iad6.prod.conviva.com:50070)
+    - upstream_airflow_base_url (base URL of the Airflow instance hosting ECO_CROSS_PAGE… DAG —
+      extract from the runbook's DAG link, e.g. 'https://conviva-airflow.prod.conviva.com')
+      Do NOT guess or hardcode this — read it from the page every time.
+  If the page cannot be read, tell the user to check the playbook manually and stop.
+
+  STEP 2 — Check the upstream DAG status.
+  upstream_dt = failed_minute − 2 min.
+  Call get_airflow_dag_runs(dag_id="ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG",
+                             start_date=upstream_dt, end_date=upstream_dt,
+                             base=upstream_airflow_base_url).
+
+      ★ BRANCH aa — No run exists for upstream_dt (upstream DAG was never triggered):
+        Follow the HDFS-check path → STEP 3.
+
+      ★ BRANCH ab — Run exists but state is "failed":
+        The upstream DAG was triggered but failed. Identify the failing task:
+        a. Call get_airflow_task_instances(dag_id="ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG",
+           dag_run_id=<run_id>) to find the failed task.
+        b. Call get_airflow_task_log on the failed task (try_number=1, then highest if more detail needed).
+        c. Read and summarise the error. Then reply:
+           "⚠️ *Upstream DAG ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG failed.*
+           *Failed task:* `[task_id]`
+           *Error:* `[key error line]`
+           Please fix the root cause, then ask me:
+           *'rerun ECO_CROSS_PAGE_EVENT_SUMMARY_SSD_MINUTE_DAG for [upstream_dt]'*"
+           Do NOT propose any trigger or rerun at this point.
+
+      ★ BRANCH ac — Run exists and state is "running" or "queued":
+        Reply: "ℹ️ Upstream DAG is already *[state]* for `[upstream_dt]`. Wait for it to complete,
+        then the flow feed sensor should succeed on retry."
+        Do NOT propose any trigger.
+
+      ★ BRANCH ad — Run exists and state is "success":
+        Upstream already ran successfully. Check HDFS anyway to confirm data landed → STEP 3.
+        If HDFS data IS there but sensor still failed, the flow feed pipeline may need a direct rerun.
+
+  STEP 3 — Check HDFS data (BRANCH aa and ad only).
+  Call check_hdfs_minute_data(failed_minute, cross_page_hdfs_path, event_summary_hdfs_path, namenode_http).
+
+      ★ BOTH paths ready → STEP 4 (propose trigger for aa; propose rerun for ad).
+      ★ Either path NOT ready:
+        Tell user: "Upstream TLB output data is not yet ready for `[upstream_dt]`. Contact the TLB team."
+        Offer: "If you'd like to trigger anyway without waiting, reply *force trigger*."
+        If user says "force trigger" → call propose_trigger_upstream_minute_dag(..., force=True).
+
+  STEP 4 — Propose actions.
+  For BRANCH aa (never triggered) with data ready:
+    Call propose_trigger_upstream_minute_dag(failed_minute, cross_page_hdfs_path,
+                                             event_summary_hdfs_path, upstream_airflow_base_url).
+    Then call propose_flow_feed_reruns_batch(dag_ids=<all DAGs from step 0a>,
+                                             start_date=failed_minute, end_date=failed_minute).
+    The batch rerun is automatically queued — it appears after the trigger is confirmed.
+
+  For BRANCH ad (upstream already succeeded) with data ready:
+    Skip the trigger. Call propose_flow_feed_reruns_batch(dag_ids=<all DAGs from step 0a>,
+                                                          start_date=failed_minute, end_date=failed_minute)
+    directly, explaining that upstream already ran — the flow feed pipelines just need a rerun.
+
+  NOTE on propose_flow_feed_reruns_batch: always use this instead of propose_rerun_dag_runs for flow
+  feed pipeline lists. It posts one message with checkboxes so the user can select which to rerun.
+  If step 0a found only one DAG, include just that one. If user typed manually (no alert), include
+  only the DAG they mentioned.
+
+  STEP 5 — Force trigger (user override).
+  If user explicitly says "trigger anyway" or "force trigger" →
+  call propose_trigger_upstream_minute_dag(..., force=True) immediately, regardless of HDFS state.
 
 IMPORTANT: Never hardcode HDFS paths or Airflow URLs. Always read them from Confluence page 4192337966 first.
-If the page cannot be read, tell the user to check the playbook manually before proceeding.
 
 Triggers: task name contains "sensor_eco_cross_page_event_summary_ssd_minute", DAG name contains "_ECO_SSD_"
 or "_DPI_SSD_" or "Cross_Page_SSD", "DPI flow feed for HH:MM is stuck/failing", "trigger upstream for minute X",
@@ -4917,6 +5300,7 @@ def handle_answer(question: str, client, channel: str, thread_ts: str, user: str
         TOOLS_THAT_POST = {
             "propose_hdfs_to_s3_repair",
             "propose_rerun_dag_runs",
+            "propose_flow_feed_reruns_batch",
             "propose_trigger_upstream_minute_dag",
             "propose_confluence_update",
             "propose_new_confluence_page",
@@ -5248,10 +5632,15 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
     trigger = pending_trigger_upstream.pop(key, None)
     if trigger:
         reply_ts = trigger.get("thread_ts", thread_ts)
-        result   = _airflow_trigger_dag_run(
-            trigger["base"], trigger["dag_id"],
-            trigger["dag_run_id"], trigger["logical_date"], trigger["conf"],
-        )
+        existing_run_id = trigger.get("existing_run_id")
+        if existing_run_id:
+            # Run already exists (was failed/success) — clear it instead of creating a new one
+            result = _airflow_clear_dag_run(trigger["base"], trigger["dag_id"], existing_run_id)
+        else:
+            result = _airflow_trigger_dag_run(
+                trigger["base"], trigger["dag_id"],
+                trigger["dag_run_id"], trigger["logical_date"], trigger["conf"],
+            )
         if result["ok"]:
             client.chat_postMessage(
                 channel=channel, thread_ts=reply_ts,
@@ -5269,6 +5658,8 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
                 channel=channel, thread_ts=reply_ts,
                 text=f"🤖 *SSD Bot* — ❌ Trigger failed: `{result['error']}`",
             )
+        # Whether trigger succeeded or failed, post any queued rerun proposals now
+        _dequeue_next_rerun(client, channel, reply_ts, user)
         return
 
     # ── Check for pending mark-runs action ──
@@ -5344,6 +5735,25 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
             )
         return
 
+    # ── Check for pending flow-feed batch rerun (text "yes" = confirm all) ──
+    batch = pending_flow_feed_batch.get(key)
+    if batch:
+        reply_ts = batch.get("thread_ts", thread_ts)
+        all_dags = batch.get("dag_ids", [])
+        # Collapse the interactive message if we have its ts
+        msg_ts = batch.get("message_ts")
+        if msg_ts:
+            try:
+                client.chat_update(
+                    channel=channel, ts=msg_ts,
+                    text=f"✅ Confirmed via text — rerunning all {len(all_dags)} pipeline(s).",
+                    blocks=[],
+                )
+            except Exception:
+                pass
+        _execute_flow_feed_batch_rerun(client, channel, reply_ts, user, all_dags)
+        return
+
     # ── Check for pending rerun/backfill action ──
     rerun = pending_rerun_runs.pop(key, None)
     if rerun:
@@ -5391,6 +5801,8 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
                     f"Check the bot logs or try clearing manually in the Airflow UI."
                 ),
             )
+        # Post next queued rerun proposal if any
+        _dequeue_next_rerun(client, channel, reply_ts, user)
         return
 
     # ── Check for pending interleaved rerun ──
@@ -5622,6 +6034,8 @@ def handle_cancel(client, channel: str, thread_ts: str, user: str):
     pending_pages.pop((channel, user), None)
     pending_mark_runs.pop((channel, user), None)
     pending_rerun_runs.pop((channel, user), None)
+    pending_rerun_queue.pop((channel, user), None)
+    pending_flow_feed_batch.pop((channel, user), None)
     pending_trigger_upstream.pop((channel, user), None)
     pending_backfill.pop((channel, user), None)
     pending_interleaved_rerun.pop((channel, user), None)
@@ -5653,6 +6067,87 @@ TARGET_CHANNELS = [
     # Add more channel IDs here if needed
 ]
 
+@slack_app.action("flow_feed_confirm_rerun")
+def handle_flow_feed_confirm(ack, body, client):
+    """User clicked '✅ Rerun Selected' on the batch flow-feed rerun proposal."""
+    ack()
+    channel  = body["channel"]["id"]
+    user     = body["user"]["id"]
+    msg_ts   = body["message"]["ts"]
+    thread_ts = body["message"].get("thread_ts", msg_ts)
+
+    # Read which checkboxes are currently selected from block state
+    state    = body.get("state", {}).get("values", {})
+    selected = []
+    for _block_id, block_state in state.items():
+        for _action_id, action_state in block_state.items():
+            opts = action_state.get("selected_options", [])
+            if opts:
+                selected.extend(o["value"] for o in opts)
+
+    if not selected:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="🤖 *SSD Bot* — No pipelines selected. Rerun cancelled.",
+        )
+        pending_flow_feed_batch.pop((channel, user), None)
+        # Update the original message to show cancelled state
+        client.chat_update(
+            channel=channel, ts=msg_ts,
+            text="❌ Rerun cancelled — no pipelines selected.",
+            blocks=[],
+        )
+        return
+
+    # Update the original message to remove interactive elements (prevent double-click)
+    try:
+        client.chat_update(
+            channel=channel, ts=msg_ts,
+            text=f"⏳ Running reruns for: {', '.join(f'`{d}`' for d in selected)}…",
+            blocks=[{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"⏳ *Processing reruns…*\nSelected: {', '.join(f'`{d}`' for d in selected)}",
+                },
+            }],
+        )
+    except Exception:
+        pass
+
+    _execute_flow_feed_batch_rerun(client, channel, thread_ts, user, selected)
+
+
+@slack_app.action("flow_feed_cancel_rerun")
+def handle_flow_feed_cancel(ack, body, client):
+    """User clicked '❌ Cancel' on the batch flow-feed rerun proposal."""
+    ack()
+    channel  = body["channel"]["id"]
+    user     = body["user"]["id"]
+    msg_ts   = body["message"]["ts"]
+    thread_ts = body["message"].get("thread_ts", msg_ts)
+
+    pending_flow_feed_batch.pop((channel, user), None)
+    try:
+        client.chat_update(
+            channel=channel, ts=msg_ts,
+            text="❌ Rerun cancelled.",
+            blocks=[],
+        )
+    except Exception:
+        pass
+    client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text="🤖 *SSD Bot* — ❌ Flow feed rerun cancelled.",
+    )
+
+
+@slack_app.action("flow_feed_select")
+def handle_flow_feed_select(ack, body):
+    """Acknowledge checkbox toggle (no-op — state read on confirm click)."""
+    ack()
+
+
 @slack_app.event("message")
 def handle_message_events(body, event, client, logger):
     """Handle plain messages — thread follow-ups and confirm/cancel from channel level."""
@@ -5680,6 +6175,7 @@ def handle_message_events(body, event, client, logger):
         (channel, user) in pending_pages or
         (channel, user) in pending_mark_runs or
         (channel, user) in pending_rerun_runs or
+        (channel, user) in pending_flow_feed_batch or
         (channel, user) in pending_trigger_upstream or
         (channel, user) in pending_backfill or
         (channel, user) in pending_interleaved_rerun or
