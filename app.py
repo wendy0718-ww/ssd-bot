@@ -967,7 +967,11 @@ def _airflow_backfill_create_or_patch(base: str, dag_id: str, logical_date: str)
 
             else:
                 # Step 2: run doesn't exist — create it (state is read-only on POST)
-                run_id    = f"backfill__{logical_date}"
+                # Use "scheduled__" prefix so Airflow treats this as run_type=scheduled.
+                # The scheduler advances its internal cursor only based on "scheduled" runs;
+                # "backfill__" runs are ignored for cursor advancement, causing the scheduler
+                # to keep resetting Next Run to the last real scheduled run.
+                run_id    = f"scheduled__{logical_date}"
                 post_url  = f"{base}/api/v1/dags/{dag_id}/dagRuns"
                 patch_url = f"{base}/api/v1/dags/{dag_id}/dagRuns/{run_id}"
                 resp = requests.post(post_url, headers=headers,
