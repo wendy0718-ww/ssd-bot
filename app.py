@@ -1997,7 +1997,12 @@ def tool_propose_trigger_hourly_dag_with_conf(
     if (end_dt - start_dt) > timedelta(hours=4):
         return "Window is wider than 4 hours — please trigger one hour at a time to avoid scheduler issues."
 
-    base = _airflow_base(instance)
+    if instance and instance in AIRFLOW_INSTANCES:
+        base = AIRFLOW_INSTANCES[instance]
+    elif "streamnew" in AIRFLOW_INSTANCES:
+        base = AIRFLOW_INSTANCES["streamnew"]
+    else:
+        base = next(iter(AIRFLOW_INSTANCES.values()))
     conf = _build_eco_event_hourly_conf(dag_id, start_dt, end_dt, hdfs_cluster_path)
     run_id = conf["name"]
 
