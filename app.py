@@ -150,6 +150,9 @@ pending_rerun_queue: dict = {}
 # Pending upstream minute DAG trigger awaiting human confirmation
 pending_trigger_upstream: dict = {}
 
+# Pending ECO_Event_Hourly (or similar hourly) DAG run with custom conf awaiting human confirmation
+pending_trigger_hourly_dag: dict = {}
+
 # Pending HDFS → S3 repair copy awaiting human confirmation
 pending_hdfs_s3_copy: dict = {}
 
@@ -791,6 +794,36 @@ def _airflow_mark_dag_run(base: str, dag_id: str, dag_run_id: str, state: str) -
     except Exception as e:
         logger.error(f"_airflow_mark_dag_run error: {e}")
         return False
+
+
+def _airflow_get_dag_paused(base: str, dag_id: str) -> Optional[bool]:
+    """Return True if DAG is paused, False if active, None on error."""
+    headers = _get_airflow_headers(base)
+    url = f"{base}/api/v1/dags/{dag_id}"
+    try:
+        resp = requests.get(url, headers=headers, verify=False, timeout=15)
+        if resp.ok:
+            return resp.json().get("is_paused", False)
+        logger.warning(f"_airflow_get_dag_paused {dag_id} → {resp.status_code}")
+    except Exception as e:
+        logger.error(f"_airflow_get_dag_paused error: {e}")
+    return None
+
+
+def _airflow_set_dag_paused(base: str, dag_id: str, paused: bool) -> bool:
+    """Pause or unpause a DAG via REST API. Returns True on success."""
+    headers = _get_airflow_headers(base)
+    url = f"{base}/api/v1/dags/{dag_id}"
+    try:
+        resp = requests.patch(url, headers=headers,
+                              json={"is_paused": paused}, verify=False, timeout=15)
+        if resp.ok:
+            logger.info(f"_airflow_set_dag_paused: {dag_id} paused={paused}")
+            return True
+        logger.warning(f"_airflow_set_dag_paused {dag_id} paused={paused} → {resp.status_code}: {resp.text[:100]}")
+    except Exception as e:
+        logger.error(f"_airflow_set_dag_paused error: {e}")
+    return False
 
 
 def _airflow_sweep_running_runs(base: str, dag_id: str, start_dt: str, end_dt: str) -> dict:
@@ -1875,10 +1908,11 @@ def _airflow_trigger_dag_run(base: str, dag_id: str, dag_run_id: str,
     headers = _get_airflow_headers(base)
     url = f"{base}/api/v1/dags/{dag_id}/dagRuns"
     payload = {
-        "dag_run_id":   dag_run_id,
-        "logical_date": logical_date,
-        "conf":         conf,
+        "dag_run_id": dag_run_id,
+        "conf":       conf,
     }
+    if logical_date is not None:
+        payload["logical_date"] = logical_date
     try:
         resp = requests.post(url, headers=headers, json=payload, verify=False, timeout=30)
         logger.info(f"trigger_dag_run {dag_id} {logical_date} → {resp.status_code}: {resp.text[:300]}")
@@ -1888,6 +1922,113 @@ def _airflow_trigger_dag_run(base: str, dag_id: str, dag_run_id: str,
     except Exception as e:
         logger.error(f"_airflow_trigger_dag_run error: {e}")
         return {"ok": False, "error": str(e)}
+
+
+def _build_eco_event_hourly_conf(dag_id: str, start_dt: datetime, end_dt: datetime,
+                                  hdfs_cluster_path: str) -> dict:
+    """Build the conf dict for ECO_Event_Hourly (or similar) manual DAG run.
+
+    Args:
+        dag_id:            DAG name, used for the 'name' field.
+        start_dt:          Start of the hour window (UTC, e.g. 2026-09-05 18:00:00).
+        end_dt:            End   of the hour window (UTC, e.g. 2026-09-05 19:00:00).
+        hdfs_cluster_path: Cluster sub-path, e.g. '/tlb2/tlb2-eco-repair-1/'.
+                           Must start and end with '/'.
+    """
+    cluster = hdfs_cluster_path.strip("/")          # e.g. tlb2/tlb2-eco-repair-1
+    start_ts = int(start_dt.replace(tzinfo=timezone.utc).timestamp())
+    end_ts   = int(end_dt.replace(tzinfo=timezone.utc).timestamp())
+
+    # Date components for path building
+    y   = start_dt.strftime("%Y")
+    mo  = start_dt.strftime("%m")
+    d   = start_dt.strftime("%d")
+    h   = start_dt.strftime("%H")
+    date_label = start_dt.strftime("%Y-%m-%d")
+    sh = start_dt.strftime("%H-%M")
+    eh = end_dt.strftime("%H-%M")
+    name = f"{dag_id}-{date_label}-{sh}-to-{eh}-{start_ts}"
+
+    nameservice = "hdfs://nameservice-aa"
+    raw_sink  = "ecoRawEventTableSsdFileSink"
+    evt_sink  = "ecoEventTableSsdFileSink"
+
+    raw_paths = ",".join(
+        f"{nameservice}/{cluster}/{raw_sink}/{y}/{mo}/{d}/{h}/{mm:02d}/"
+        for mm in range(60)
+    )
+    evt_paths = ",".join(
+        f"{nameservice}/{cluster}/{evt_sink}/{y}/{mo}/{d}/{h}/{mm:02d}/"
+        for mm in range(60)
+    )
+
+    return {
+        "name":          name,
+        "startTimeSec":  str(start_ts),
+        "endTimeSec":    str(end_ts),
+        "rawInputPaths": raw_paths,
+        "inputPaths":    evt_paths,
+    }
+
+
+def tool_propose_trigger_hourly_dag_with_conf(
+        dag_id: str,
+        start_date: str,
+        end_date: str,
+        hdfs_cluster_path: str,
+        instance: str = "",
+        channel: str = "", thread_ts: str = "",
+        user: str = "", client=None) -> str:
+    """Propose triggering an hourly DAG run (e.g. ECO_Event_Hourly) with a generated conf JSON.
+
+    Builds rawInputPaths / inputPaths for every minute in [start_date, end_date),
+    shows the user a preview, and waits for yes/no confirmation before triggering.
+    """
+    # Parse start / end
+    try:
+        start_dt = datetime.fromisoformat(_normalise_dt(start_date))
+        end_dt   = datetime.fromisoformat(_normalise_dt(end_date))
+    except ValueError as e:
+        return f"Could not parse dates: {e}. Use format '2026-09-05 18:00:00'."
+
+    if end_dt <= start_dt:
+        return "end_date must be after start_date."
+    if (end_dt - start_dt) > timedelta(hours=4):
+        return "Window is wider than 4 hours — please trigger one hour at a time to avoid scheduler issues."
+
+    base = _airflow_base(instance)
+    conf = _build_eco_event_hourly_conf(dag_id, start_dt, end_dt, hdfs_cluster_path)
+    run_id = conf["name"]
+
+    # Count minute paths for summary
+    n_minutes = int((end_dt - start_dt).total_seconds() // 60)
+    cluster = hdfs_cluster_path.strip("/")
+    preview_conf = {k: v if k != "rawInputPaths" and k != "inputPaths" else f"<{n_minutes} paths>" for k, v in conf.items()}
+
+    pending_trigger_hourly_dag[(channel, user)] = {
+        "dag_id":      dag_id,
+        "base":        base,
+        "run_id":      run_id,
+        "conf":        conf,
+        "start_date":  start_date,
+        "thread_ts":   thread_ts,
+    }
+
+    preview_text = json.dumps(preview_conf, indent=2)
+    if client:
+        client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=(
+                f"⚡ *Proposed: Trigger `{dag_id}` with custom conf*\n\n"
+                f"*Window:* `{start_date}` → `{end_date}` ({n_minutes} minutes)\n"
+                f"*HDFS cluster:* `{cluster}`\n"
+                f"*Run ID:* `{run_id}`\n"
+                f"*Airflow:* {base}\n\n"
+                f"*Config (paths abbreviated):*\n```{preview_text}```\n\n"
+                f"Reply *yes* to trigger, or *no* to cancel."
+            ),
+        )
+    return f"✅ Preview posted. Waiting for yes/no to trigger `{dag_id}` for `{start_date}`."
 
 
 def _airflow_clear_dag_run(base: str, dag_id: str, dag_run_id: str) -> dict:
@@ -4448,6 +4589,47 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "propose_trigger_hourly_dag_with_conf",
+        "description": (
+            "Propose triggering an hourly DAG run (such as ECO_Event_Hourly) with a custom-built conf JSON. "
+            "Use when the user says something like 'run ECO_Event_Hourly with 2026-09-05-18-00-to-19-00 with input path /tlb2/tlb2-eco-repair-1/' "
+            "or 'manually trigger ECO_Event_Hourly for [time range] using [HDFS cluster path]'. "
+            "Generates all 60 per-minute rawInputPaths and inputPaths automatically, shows a preview, "
+            "and waits for yes/no before triggering. Trigger one hour at a time."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dag_id": {
+                    "type": "string",
+                    "description": "The DAG ID to trigger, e.g. 'ECO_Event_Hourly'.",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Start of the hour window in UTC, e.g. '2026-09-05 18:00:00'.",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "End of the hour window in UTC (exclusive), e.g. '2026-09-05 19:00:00'.",
+                },
+                "hdfs_cluster_path": {
+                    "type": "string",
+                    "description": (
+                        "The HDFS cluster sub-path to use for rawInputPaths and inputPaths. "
+                        "e.g. '/tlb2/tlb2-eco-repair-1/' or '/tlb2/tlb2-aa-prod/'. "
+                        "The full path is built as: "
+                        "hdfs://nameservice-aa/<cluster>/<sink>/YYYY/MM/DD/HH/mm/"
+                    ),
+                },
+                "instance": {
+                    "type": "string",
+                    "description": "Airflow instance: 'streamnew' (conviva-airflow.prod.conviva.com) or 'connect' (airflow-prod.mds.conviva.com). Defaults to 'streamnew' for ECO_Event_Hourly.",
+                },
+            },
+            "required": ["dag_id", "start_date", "end_date", "hdfs_cluster_path"],
+        },
+    },
+    {
         "name": "get_flow_feed_failures_at_minute",
         "description": (
             "Query #piccolo-daas-alert to find ALL DPI Flow Feed pipelines that failed at the same "
@@ -4666,6 +4848,18 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             hdfs_url=inputs["hdfs_url"],
             s3_url=inputs["s3_url"],
             file_filter=inputs.get("file_filter"),
+            channel=ctx.get("channel", ""),
+            thread_ts=ctx.get("thread_ts", ""),
+            user=ctx.get("user", ""),
+            client=ctx.get("client"),
+        )
+    if name == "propose_trigger_hourly_dag_with_conf":
+        return tool_propose_trigger_hourly_dag_with_conf(
+            dag_id=inputs["dag_id"],
+            start_date=inputs["start_date"],
+            end_date=inputs["end_date"],
+            hdfs_cluster_path=inputs["hdfs_cluster_path"],
+            instance=inputs.get("instance", "streamnew"),
             channel=ctx.get("channel", ""),
             thread_ts=ctx.get("thread_ts", ""),
             user=ctx.get("user", ""),
@@ -5786,6 +5980,31 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
         _dequeue_next_rerun(client, channel, reply_ts, user)
         return
 
+    # ── Check for pending hourly DAG trigger with conf ──
+    hourly_trig = pending_trigger_hourly_dag.pop(key, None)
+    if hourly_trig:
+        reply_ts = hourly_trig.get("thread_ts", thread_ts)
+        result = _airflow_trigger_dag_run(
+            hourly_trig["base"], hourly_trig["dag_id"],
+            hourly_trig["run_id"], None, hourly_trig["conf"],
+        )
+        if result["ok"]:
+            client.chat_postMessage(
+                channel=channel, thread_ts=reply_ts,
+                text=(
+                    f"🤖 *SSD Bot* — ⚡ DAG triggered!\n"
+                    f"*DAG:* `{hourly_trig['dag_id']}`\n"
+                    f"*Run ID:* `{hourly_trig['run_id']}`\n\n"
+                    f"Monitor at: <{hourly_trig['base']}/dags/{hourly_trig['dag_id']}/grid|{hourly_trig['dag_id']}>"
+                ),
+            )
+        else:
+            client.chat_postMessage(
+                channel=channel, thread_ts=reply_ts,
+                text=f"🤖 *SSD Bot* — ❌ Trigger failed: `{result['error']}`",
+            )
+        return
+
     # ── Check for pending mark-runs action ──
     mark = pending_mark_runs.pop(key, None)
     if mark:
@@ -6060,16 +6279,28 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
             else:
                 kill_summary = f"\n⚡ Kill running tasks: {result['killed']} task instance(s) interrupted."
 
-        # Step 2 — create/patch each date to success
-        for ld in dates:
-            result = _airflow_backfill_create_or_patch(base, dag_id, ld)
-            if result["ok"]:
-                if result["action"] == "created":
-                    created += 1
+        # Step 2 — if DAG is active, pause it so the scheduler doesn't interfere
+        # with next_dagrun updates during the batch. Unpause only if we paused it.
+        already_paused = _airflow_get_dag_paused(base, dag_id)
+        should_unpause = False
+        if already_paused is False:
+            # DAG is active — pause it for the duration of the backfill
+            if _airflow_set_dag_paused(base, dag_id, True):
+                should_unpause = True
+        # If already_paused is True or None (error), proceed without touching pause state
+        try:
+            for ld in dates:
+                result = _airflow_backfill_create_or_patch(base, dag_id, ld)
+                if result["ok"]:
+                    if result["action"] == "created":
+                        created += 1
+                    else:
+                        patched += 1
                 else:
-                    patched += 1
-            else:
-                errors.append(f"`{ld}`: {result['detail']}")
+                    errors.append(f"`{ld}`: {result['detail']}")
+        finally:
+            if should_unpause:
+                _airflow_set_dag_paused(base, dag_id, False)
 
         # Step 3 — sweep: catch any runs still showing as 'running' in the range
         sweep_summary = ""
@@ -6161,6 +6392,7 @@ def handle_cancel(client, channel: str, thread_ts: str, user: str):
     pending_rerun_queue.pop((channel, user), None)
     pending_flow_feed_batch.pop((channel, user), None)
     pending_trigger_upstream.pop((channel, user), None)
+    pending_trigger_hourly_dag.pop((channel, user), None)
     pending_backfill.pop((channel, user), None)
     pending_interleaved_rerun.pop((channel, user), None)
     pending_hdfs_s3_copy.pop((channel, user), None)
@@ -6302,6 +6534,7 @@ def handle_message_events(body, event, client, logger):
         (channel, user) in pending_rerun_runs or
         (channel, user) in pending_flow_feed_batch or
         (channel, user) in pending_trigger_upstream or
+        (channel, user) in pending_trigger_hourly_dag or
         (channel, user) in pending_backfill or
         (channel, user) in pending_interleaved_rerun or
         (channel, user) in active_interleaved_reruns or  # allow "cancel rerun" mid-run
