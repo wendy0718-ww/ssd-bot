@@ -2020,6 +2020,9 @@ def tool_propose_trigger_hourly_dag_with_conf(
         "thread_ts":   thread_ts,
     }
 
+    # Show the first actual path so user can verify the cluster is correct
+    first_raw = conf["rawInputPaths"].split(",")[0]
+    first_evt = conf["inputPaths"].split(",")[0]
     preview_text = json.dumps(preview_conf, indent=2)
     if client:
         client.chat_postMessage(
@@ -2030,7 +2033,9 @@ def tool_propose_trigger_hourly_dag_with_conf(
                 f"*HDFS cluster:* `{cluster}`\n"
                 f"*Run ID:* `{run_id}`\n"
                 f"*Airflow:* {base}\n\n"
-                f"*Config (paths abbreviated):*\n```{preview_text}```\n\n"
+                f"*First rawInputPath (verify cluster is correct!):*\n`{first_raw}`\n"
+                f"*First inputPath:*\n`{first_evt}`\n\n"
+                f"*Full conf (paths abbreviated):*\n```{preview_text}```\n\n"
                 f"Reply *yes* to trigger, or *no* to cancel."
             ),
         )
