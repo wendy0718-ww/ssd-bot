@@ -33,6 +33,7 @@ import threading
 import requests
 import urllib3
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
