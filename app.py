@@ -2978,6 +2978,7 @@ def _preprocess_hdfs_url(url: str) -> tuple:
 
 
 HDFS_S3_COPY_AUTHORIZED_EMAIL = "dwan@conviva.com"
+HDFS_S3_COPY_AUTHORIZED_SLACK_IDS = {"U07D2SCUCM6"}  # Wendy Wan
 
 
 def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
@@ -3005,24 +3006,18 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
     import fnmatch as _fnmatch
 
     # ── Authorization check ──
-    # Only HDFS_S3_COPY_AUTHORIZED_EMAIL is allowed to trigger HDFS→S3 copies.
-    if client and user:
-        try:
-            user_info = client.users_info(user=user)
-            user_email = user_info["user"]["profile"].get("email", "").lower()
-        except Exception:
-            user_email = ""
-        if user_email != HDFS_S3_COPY_AUTHORIZED_EMAIL:
-            if client and channel:
-                client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_ts or None,
-                    text=(
-                        "🔒 Only Wendy Wan can trigger HDFS → S3 copies. "
-                        "Please ask her to run this command."
-                    ),
-                )
-            return "Unauthorized: HDFS→S3 copy restricted to Wendy Wan."
+    # Only authorized Slack user IDs can trigger HDFS→S3 copies.
+    if user and user not in HDFS_S3_COPY_AUTHORIZED_SLACK_IDS:
+        if client and channel:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts or None,
+                text=(
+                    "🔒 Only Wendy Wan can trigger HDFS → S3 copies. "
+                    "Please ask her to run this command."
+                ),
+            )
+        return "Unauthorized: HDFS→S3 copy restricted to Wendy Wan."
 
     # ── Brace expansion in the URL itself ──
     hdfs_url, brace_filter = _preprocess_hdfs_url(hdfs_url)
