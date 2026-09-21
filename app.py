@@ -2979,6 +2979,7 @@ def _preprocess_hdfs_url(url: str) -> tuple:
 
 HDFS_S3_COPY_AUTHORIZED_EMAIL = "dwan@conviva.com"
 HDFS_S3_COPY_AUTHORIZED_SLACK_IDS = {"U07D2SCUCM6"}  # Wendy Wan
+HDFS_S3_COPY_ALLOWED_BUCKETS = {"conviva-daas-dev"}   # Only these S3 buckets are permitted
 
 
 def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
@@ -3018,6 +3019,21 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
                 ),
             )
         return "Unauthorized: HDFS→S3 copy restricted to Wendy Wan."
+
+    # ── Destination bucket allowlist check ──
+    try:
+        dest_bucket = re.match(r"s3a?://([^/]+)", s3_url.strip()).group(1)
+    except Exception:
+        dest_bucket = ""
+    if dest_bucket not in HDFS_S3_COPY_ALLOWED_BUCKETS:
+        if client and channel:
+            client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts or None,
+                text=f"🚫 Don't have access to the dest bucket `{dest_bucket}`. "
+                     f"Only copies to `s3://conviva-daas-dev/` are allowed.",
+            )
+        return f"Destination bucket '{dest_bucket}' is not in the allowed list."
 
     # ── Brace expansion in the URL itself ──
     hdfs_url, brace_filter = _preprocess_hdfs_url(hdfs_url)
@@ -3082,8 +3098,8 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
             channel=channel, thread_ts=thread_ts,
             text=(
                 f"📦 *Proposed: HDFS → S3 Repair Copy*\n\n"
-                f"*Source (HDFS):* `{namenode}{hdfs_path}/`\n"
-                f"*Destination (S3):* `s3://{s3_bucket}/{s3_prefix}/`\n"
+                f"*Source (HDFS):* `{namenode}{hdfs_path}`\n"
+                f"*Destination (S3):* `s3://{s3_bucket}/{s3_prefix}`\n"
                 f"*AWS profile:* `{aws_profile}`\n"
                 f"*Files found:* {len(files)}{filter_note}\n\n"
                 f"{sample_lines}\n\n"
