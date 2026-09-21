@@ -2775,21 +2775,29 @@ def _parse_hdfs_url_to_webhdfs(url: str) -> tuple:
       http://host:50070/explorer.html#/path → (http://host:50070, /path)
       hdfs://host:8020/path               → (http://host:50070, /path)
     """
+    def _norm(path: str) -> str:
+        """Collapse consecutive slashes (e.g. /tmp/prod//foo → /tmp/prod/foo)."""
+        return re.sub(r'/+', '/', path)
+
     url = url.strip().rstrip("/")
     m = re.match(r"(https?://[^/]+)/webhdfs/v1(/.*)", url)
     if m:
-        return m.group(1), m.group(2)
+        return m.group(1), _norm(m.group(2))
     m = re.match(r"(https?://[^/]+)/explorer\.html#(/.*)", url)
     if m:
-        return m.group(1), m.group(2)
+        return m.group(1), _norm(m.group(2))
     m = re.match(r"hdfs://([^:/]+)(?::\d+)?(/.*)", url)
     if m:
-        return f"http://{m.group(1)}:50070", m.group(2)
+        return f"http://{m.group(1)}:50070", _norm(m.group(2))
     raise ValueError(f"Cannot parse HDFS URL: {url}")
 
 
 def _webhdfs_list_files(namenode: str, path: str) -> list:
-    """Recursively list all files (not dirs) under an HDFS path via WebHDFS."""
+    """Recursively list all files (not dirs) under an HDFS path via WebHDFS.
+
+    When LISTSTATUS is called on a single file, WebHDFS returns pathSuffix=""
+    — handle that by returning the path itself, not path + "/".
+    """
     url = f"{namenode}/webhdfs/v1{path}?op=LISTSTATUS"
     resp = requests.get(url, verify=False, timeout=30)
     if not resp.ok:
@@ -2797,16 +2805,25 @@ def _webhdfs_list_files(namenode: str, path: str) -> list:
     files = []
     for item in resp.json().get("FileStatuses", {}).get("FileStatus", []):
         name = item["pathSuffix"]
-        item_path = f"{path.rstrip('/')}/{name}"
-        if item["type"] == "FILE":
-            files.append(item_path)
-        elif item["type"] == "DIRECTORY":
-            files.extend(_webhdfs_list_files(namenode, item_path))
+        if name == "":
+            # path itself is the file (LISTSTATUS on a file returns empty pathSuffix)
+            if item["type"] == "FILE":
+                files.append(path)
+        else:
+            item_path = f"{path.rstrip('/')}/{name}"
+            if item["type"] == "FILE":
+                files.append(item_path)
+            elif item["type"] == "DIRECTORY":
+                files.extend(_webhdfs_list_files(namenode, item_path))
     return files
 
 
 def _webhdfs_list_files_with_sizes(namenode: str, path: str) -> list:
-    """Recursively list files with sizes: returns list of (hdfs_path, size_bytes)."""
+    """Recursively list files with sizes: returns list of (hdfs_path, size_bytes).
+
+    When LISTSTATUS is called on a single file, WebHDFS returns pathSuffix=""
+    — handle that by returning the path itself, not path + "/".
+    """
     url = f"{namenode}/webhdfs/v1{path}?op=LISTSTATUS"
     resp = requests.get(url, verify=False, timeout=30)
     if not resp.ok:
@@ -2814,11 +2831,15 @@ def _webhdfs_list_files_with_sizes(namenode: str, path: str) -> list:
     files = []
     for item in resp.json().get("FileStatuses", {}).get("FileStatus", []):
         name = item["pathSuffix"]
-        item_path = f"{path.rstrip('/')}/{name}"
-        if item["type"] == "FILE":
-            files.append((item_path, item.get("length", 0)))
-        elif item["type"] == "DIRECTORY":
-            files.extend(_webhdfs_list_files_with_sizes(namenode, item_path))
+        if name == "":
+            if item["type"] == "FILE":
+                files.append((path, item.get("length", 0)))
+        else:
+            item_path = f"{path.rstrip('/')}/{name}"
+            if item["type"] == "FILE":
+                files.append((item_path, item.get("length", 0)))
+            elif item["type"] == "DIRECTORY":
+                files.extend(_webhdfs_list_files_with_sizes(namenode, item_path))
     return files
 
 
@@ -2956,6 +2977,9 @@ def _preprocess_hdfs_url(url: str) -> tuple:
     return url, []
 
 
+HDFS_S3_COPY_AUTHORIZED_EMAIL = "dwan@conviva.com"
+
+
 def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
                                     file_filter: list = None,
                                     channel: str = "", thread_ts: str = "",
@@ -2979,6 +3003,26 @@ def tool_propose_hdfs_to_s3_repair(hdfs_url: str, s3_url: str,
                                'DailySessionLog_SunNXT_2026-08-28.csv.gz']
     """
     import fnmatch as _fnmatch
+
+    # ── Authorization check ──
+    # Only HDFS_S3_COPY_AUTHORIZED_EMAIL is allowed to trigger HDFS→S3 copies.
+    if client and user:
+        try:
+            user_info = client.users_info(user=user)
+            user_email = user_info["user"]["profile"].get("email", "").lower()
+        except Exception:
+            user_email = ""
+        if user_email != HDFS_S3_COPY_AUTHORIZED_EMAIL:
+            if client and channel:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts or None,
+                    text=(
+                        "🔒 Only Wendy Wan can trigger HDFS → S3 copies. "
+                        "Please ask her to run this command."
+                    ),
+                )
+            return "Unauthorized: HDFS→S3 copy restricted to Wendy Wan."
 
     # ── Brace expansion in the URL itself ──
     hdfs_url, brace_filter = _preprocess_hdfs_url(hdfs_url)
@@ -6234,7 +6278,12 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
 
         for hdfs_file_path in files:
             rel_path = hdfs_file_path[len(hdfs_path):].lstrip("/")
-            s3_key   = f"{s3_prefix}/{rel_path}" if s3_prefix else rel_path
+            if rel_path:
+                # Normal case: file inside a directory
+                s3_key = f"{s3_prefix}/{rel_path}" if s3_prefix else rel_path
+            else:
+                # Single-file copy: hdfs_path IS the file; s3_prefix is the exact destination key
+                s3_key = s3_prefix if s3_prefix else hdfs_file_path.split("/")[-1]
             webhdfs_url = f"{namenode}/webhdfs/v1{hdfs_file_path}?op=OPEN"
             try:
                 resp = requests.get(webhdfs_url, stream=True, verify=False, timeout=120)
