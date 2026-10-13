@@ -6277,6 +6277,7 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
         success_count = 0
         fail_count    = 0
         errors        = []
+        copied_keys   = []
 
         try:
             import boto3
@@ -6290,8 +6291,15 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
         for hdfs_file_path in files:
             rel_path = hdfs_file_path[len(hdfs_path):].lstrip("/")
             if rel_path:
-                # Normal case: file inside a directory
-                s3_key = f"{s3_prefix}/{rel_path}" if s3_prefix else rel_path
+                # Normal case: file inside a directory → append relative path to dest.
+                # Exception: "directory-named-like-file" case — HDFS path looks like a file
+                # (e.g. DailySessionLog_MEO_2026-09-20.csv.gz) but is actually a directory
+                # containing a same-named file. The user already included the filename in
+                # s3_url, so don't double-append it (would create .csv.gz/filename on S3).
+                if s3_prefix.endswith("/" + rel_path) or s3_prefix == rel_path:
+                    s3_key = s3_prefix
+                else:
+                    s3_key = f"{s3_prefix}/{rel_path}" if s3_prefix else rel_path
             else:
                 # Single-file copy: hdfs_path IS the file; s3_prefix is the exact destination key
                 s3_key = s3_prefix if s3_prefix else hdfs_file_path.split("/")[-1]
@@ -6301,6 +6309,7 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
                 resp.raise_for_status()
                 s3_client.upload_fileobj(resp.raw, s3_bucket, s3_key)
                 success_count += 1
+                copied_keys.append(s3_key)
                 logger.info(f"HDFS→S3 copied {hdfs_file_path} → s3://{s3_bucket}/{s3_key}")
             except Exception as e:
                 fail_count += 1
@@ -6309,11 +6318,16 @@ def handle_confirm(client, channel: str, thread_ts: str, user: str):
                 logger.error(f"HDFS→S3 copy failed {hdfs_file_path}: {e}")
 
         if fail_count == 0:
+            # Show the actual S3 keys copied (not s3_prefix with a misleading trailing slash)
+            if len(copied_keys) == 1:
+                dest_display = f"`s3://{s3_bucket}/{copied_keys[0]}`"
+            else:
+                dest_display = f"`s3://{s3_bucket}/{s3_prefix}/` ({success_count} files)"
             client.chat_postMessage(
                 channel=channel, thread_ts=reply_ts,
                 text=(
                     f"🤖 *SSD Bot* — ✅ HDFS → S3 copy complete!\n"
-                    f"Copied *{success_count}* file(s) to `s3://{s3_bucket}/{s3_prefix}/`"
+                    f"Copied *{success_count}* file(s) to {dest_display}"
                 ),
             )
         else:
