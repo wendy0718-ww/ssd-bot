@@ -2507,6 +2507,116 @@ def tool_lookup_pipeline(account_name: str = None, delivery_path: str = None) ->
         return f"Pipeline lookup error: {e}"
 
 
+def tool_check_pipeline_customer_consistency(dag_id: str) -> str:
+    """Check whether a Connect pipeline's SQL uses the customer_id that matches its customer name.
+
+    Extracts the customer name from the DAG ID suffix (segment before _v<N>),
+    looks up the expected customer_id via the Support Tools accounts API,
+    then fetches the DAG source from Airflow and scans for customerId references.
+    Returns a confirmation or a risk warning.
+    """
+    import re as _re
+
+    SUPPORT_TOOLS_BASE = "http://localhost:8002"
+    AIRFLOW_CONNECT_BASE = "http://airflow-prod.mds.conviva.com:8080"
+
+    # ── 1. Extract customer name from DAG ID ─────────────────────────────────
+    # Format: <prefix>_<ContentType>_<Freq>_<CustomerName>_v<N>
+    # Customer name is the segment immediately before _v<N> at the end.
+    # It may contain hyphens but not underscores.
+    m = _re.match(r'^(.+)_v\d+$', dag_id.strip())
+    if not m:
+        return f"❌ Cannot parse DAG ID format: `{dag_id}` (expected `..._<CustomerName>_v<N>`)"
+    base = m.group(1)
+    # Last underscore-separated segment = customer name
+    customer_name = base.rsplit('_', 1)[-1]
+    c3id = f"c3.{customer_name}"
+
+    # ── 2. Look up expected customer_id from Support Tools API ───────────────
+    try:
+        resp = requests.get(f"{SUPPORT_TOOLS_BASE}/api/accounts", timeout=15)
+        resp.raise_for_status()
+        accounts = resp.json()
+    except Exception as e:
+        return f"❌ Failed to fetch accounts from Support Tools: {e}"
+
+    # Case-insensitive lookup
+    expected_id = None
+    matched_c3id = None
+    for key, val in accounts.items():
+        if key.lower() == c3id.lower():
+            expected_id = val.get("customer_id")
+            matched_c3id = key
+            break
+
+    if expected_id is None:
+        return (
+            f"⚠️ *WARNING*: `{c3id}` not found in accounts cache — cannot verify.\n"
+            f"Either the account doesn't exist yet or the name in the DAG ID doesn't match the c3 name exactly.\n"
+            f"Tip: check https://cs-portal.prod.conviva.com/customers.html manually."
+        )
+
+    # ── 3. Fetch DAG source from Airflow ────────────────────────────────────
+    try:
+        dag_resp = requests.get(
+            f"{AIRFLOW_CONNECT_BASE}/api/v1/dags/{dag_id}",
+            auth=("admin", "admin"),
+            timeout=15,
+        )
+        dag_resp.raise_for_status()
+        file_token = dag_resp.json().get("file_token")
+    except Exception as e:
+        return f"❌ Failed to fetch DAG metadata from Airflow: {e}"
+
+    if not file_token:
+        return f"❌ No file_token in Airflow response for `{dag_id}`"
+
+    try:
+        src_resp = requests.get(
+            f"{AIRFLOW_CONNECT_BASE}/api/v1/dagSources/{file_token}",
+            headers={"Accept": "text/plain"},
+            auth=("admin", "admin"),
+            timeout=30,
+        )
+        src_resp.raise_for_status()
+        source = src_resp.text
+    except Exception as e:
+        return f"❌ Failed to fetch DAG source: {e}"
+
+    # ── 4. Extract all customer IDs from the SQL ─────────────────────────────
+    # Pattern 1: customerId = 1960187858  (with optional spaces around =)
+    ids_from_customer_id = set(
+        int(x) for x in _re.findall(r'customerId\s*=\s*(\d{7,})', source)
+    )
+    # Pattern 2: table suffix _1960187858 (BigQuery table names)
+    ids_from_tables = set(
+        int(x) for x in _re.findall(r'_(\d{7,})[`\s\'\"]', source)
+    )
+    all_found_ids = ids_from_customer_id | ids_from_tables
+
+    if not all_found_ids:
+        return (
+            f"⚠️ *WARNING*: No customer IDs found in `{dag_id}` source.\n"
+            f"Expected `{matched_c3id}` → `{expected_id}`. Please review the SQL manually."
+        )
+
+    # ── 5. Compare ───────────────────────────────────────────────────────────
+    wrong_ids = all_found_ids - {expected_id}
+    if not wrong_ids:
+        return (
+            f"✅ *confirmed pipeline data consistent*: "
+            f"customer name=`{customer_name}`, customerId=`{expected_id}`"
+        )
+    else:
+        wrong_str = ", ".join(f"`{i}`" for i in sorted(wrong_ids))
+        return (
+            f"🚨 *RISK — customer ID mismatch* in `{dag_id}`!\n"
+            f"  Pipeline name implies: `{matched_c3id}` → expected customerId=`{expected_id}`\n"
+            f"  But SQL references:    {wrong_str}\n"
+            f"  Please verify the DAG source at {AIRFLOW_CONNECT_BASE}/code?dag_id={dag_id}"
+        )
+
+
 def _parse_pd_alert_message(text: str, msg_ts: str = ""):
     """Parse a PagerDuty Airflow alert Slack message into structured fields.
     Returns dict with dag_id, task_id, state, dag_run_id, execution_date, alert_ts."""
@@ -4743,6 +4853,33 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "check_pipeline_customer_consistency",
+        "description": (
+            "Check whether a newly created Connect pipeline is querying data with the correct customer_id "
+            "that matches its customer name in the DAG ID. "
+            "Use this when the user says 'new pipeline check', 'verify customer ID for pipeline', "
+            "'check customer ID consistency', 'does this pipeline use the right customer ID', "
+            "or gives a DAG ID or Airflow URL and asks to verify/validate it. "
+            "Extracts the customer name from the DAG ID suffix (segment before _v<N>), "
+            "looks up the expected customer_id from the accounts list, "
+            "then scans the DAG SQL source for customerId references and compares."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "dag_id": {
+                    "type": "string",
+                    "description": (
+                        "The Airflow DAG ID to check, e.g. 'BskyB_Dailycontent_new_BSkyB_v1' or "
+                        "'c3.Citytv_ContentSSD_Daily_Citytv_v1'. "
+                        "If the user gives an Airflow URL, extract the dag_id parameter from it."
+                    ),
+                },
+            },
+            "required": ["dag_id"],
+        },
+    },
+    {
         "name": "lookup_pipeline",
         "description": (
             "Look up SSD delivery pipelines by customer account name or delivery path. "
@@ -4940,6 +5077,8 @@ def execute_tool(name: str, inputs: dict, **ctx) -> str:
             account_name=inputs.get("account_name"),
             delivery_path=inputs.get("delivery_path"),
         )
+    if name == "check_pipeline_customer_consistency":
+        return tool_check_pipeline_customer_consistency(dag_id=inputs["dag_id"])
     return f"Unknown tool: {name}"
 
 
@@ -5037,6 +5176,11 @@ and has no documentation angle.
   (today is available in your context), then call the tool. After getting the data, write a concise
   Slack-formatted digest: total count, top noisy alerts (known issues: delete_view CE-12195,
   OSG lock timeout, hourly_ssd_monitor_dag), and any alerts that may need attention.
+- When the user says "new pipeline check", "verify customer ID", "check customer ID consistency", or gives a
+  DAG ID/Airflow URL and asks to verify or validate it, call check_pipeline_customer_consistency.
+  Extract the dag_id from the URL if needed (e.g. from ?dag_id=BskyB_Dailycontent_new_BSkyB_v1).
+  The tool extracts the customer name from the DAG ID, looks up the expected customerId, fetches the DAG
+  source SQL, and confirms or flags a mismatch.
 - When the user asks "which pipelines does customer X have?", "what deliveries are configured for c3.XXX?",
   "who uses this S3/GCS path?", or "which pipeline delivers to <path>?", call lookup_pipeline.
   Pass account_name (c3.XXX format) for account-based lookups, or delivery_path for path-based lookups.
